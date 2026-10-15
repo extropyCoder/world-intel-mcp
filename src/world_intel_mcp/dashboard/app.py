@@ -7,6 +7,7 @@ All data pulled from the same source modules used by the MCP server.
 import asyncio
 import json
 import logging
+import math
 import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -18,6 +19,7 @@ load_dotenv(Path(__file__).resolve().parents[3] / ".env", override=False)
 
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
+from starlette.requests import ClientDisconnect
 from starlette.responses import HTMLResponse, JSONResponse, StreamingResponse
 from starlette.routing import Route
 
@@ -851,46 +853,87 @@ async def _fetch_vector_analytics() -> dict:
     return result
 
 
-async def api_vector_search(request):
-    """POST endpoint for semantic search against the vector store."""
-    _ensure_fetcher()
-    if _vector_store is None:
-        return JSONResponse(
-            {"error": "Vector store not available (Qdrant not running)"},
-            status_code=503,
-        )
+_VECTOR_SEARCH_MAX_BODY_BYTES = 16 * 1024
+_VECTOR_SEARCH_MAX_QUERY_CHARS = 2048
+_VECTOR_SEARCH_MAX_CATEGORY_CHARS = 128
+_VECTOR_SEARCH_MAX_HOURS = 8760
 
+
+def _vector_search_json_constant(value):
+    raise ValueError("Nonfinite JSON numbers are not allowed")
+
+
+def _vector_search_json_float(value):
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("Nonfinite JSON numbers are not allowed")
+    return number
+
+
+def _validate_vector_search(body):
+    if not isinstance(body, dict):
+        raise ValueError("JSON body must be an object")
+    query = body.get("query")
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("query must be a nonempty string")
+    if len(query) > _VECTOR_SEARCH_MAX_QUERY_CHARS:
+        raise ValueError(f"query must not exceed {_VECTOR_SEARCH_MAX_QUERY_CHARS} characters")
+
+    limit = body.get("limit", 20)
+    if type(limit) is not int or not 1 <= limit <= 50:
+        raise ValueError("limit must be an integer between 1 and 50")
+    hours = body.get("hours")
+    if hours is not None and (
+        type(hours) not in (int, float) or not 0 < hours <= _VECTOR_SEARCH_MAX_HOURS
+    ):
+        raise ValueError(f"hours must be a number greater than 0 and at most {_VECTOR_SEARCH_MAX_HOURS}")
+    category = body.get("category")
+    if category is not None and (
+        not isinstance(category, str) or len(category) > _VECTOR_SEARCH_MAX_CATEGORY_CHARS
+    ):
+        raise ValueError(f"category must be a string of at most {_VECTOR_SEARCH_MAX_CATEGORY_CHARS} characters")
+    return {"query": query.strip(), "limit": limit, "category": category,
+            "hours": float(hours) if hours is not None else None}
+
+
+async def api_vector_search(request):
+    """Validate a bounded POST body before initializing semantic search."""
     try:
-        body = await request.json()
-    except Exception:
+        raw = bytearray()
+        async for chunk in request.stream():
+            if len(raw) + len(chunk) > _VECTOR_SEARCH_MAX_BODY_BYTES:
+                return JSONResponse({"error": "Request body too large"}, status_code=413)
+            raw.extend(chunk)
+        body = json.loads(
+            raw, parse_constant=_vector_search_json_constant,
+            parse_float=_vector_search_json_float,
+        )
+    except (ValueError, UnicodeError, RecursionError, ClientDisconnect):
         return JSONResponse(
             {"error": "Invalid JSON body"},
             status_code=400,
         )
-
-    query = body.get("query", "").strip()
-    if not query:
-        return JSONResponse(
-            {"error": "Missing 'query' parameter"},
-            status_code=400,
-        )
-
-    hours = body.get("hours")
-    category = body.get("category")
-    limit = min(int(body.get("limit", 20)), 50)
+    try:
+        arguments = _validate_vector_search(body)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
 
     try:
-        results = await _vector_store.semantic_search(
-            query=query,
-            limit=limit,
-            category=category,
-            hours=float(hours) if hours else None,
-        )
+        _ensure_fetcher()
+        if _vector_store is None:
+            return JSONResponse(
+                {"error": "Vector store not available (Qdrant not running)"},
+                status_code=503,
+            )
+        results = await _vector_store.semantic_search(**arguments)
+        if isinstance(results, dict) and "error" in results:
+            logger.error("Vector search failed: %s", results["error"])
+            return JSONResponse({"error": "Vector search failed"}, status_code=500)
         return JSONResponse(results)
-    except Exception as exc:
+    except Exception:
         logger.exception("Vector search failed")
         return JSONResponse(
-            {"error": str(exc)},
+            {"error": "Vector search failed"},
             status_code=500,
         )
 

@@ -127,6 +127,17 @@ the dashboard. Do not expose it publicly. The launcher disables proxy-header
 trust; if running Uvicorn directly, also pass `--no-proxy-headers` so forwarded
 headers cannot rewrite the request scheme.
 
+Dashboard `POST /api/vector-search` accepts a JSON object of at most 16 KiB:
+`query` is a nonempty string (at most 2,048 characters before trimming),
+`limit` is an integer from 1–50 (default 20), and optional `hours` is a finite
+JSON number greater than 0 and at most 8,760 (or `null` for no time filter).
+Optional `category` is an exact-match string of at most 128 characters; custom
+categories are supported, and `null` or `""` means no category filter. Numeric
+strings and booleans are not accepted as numbers. Invalid input returns 400,
+oversized bodies 413, unavailable vector storage 503, and internal search
+failures a generic 500. Validation happens before request-time initialization.
+These limits apply to the dashboard endpoint, not the MCP vector-search API.
+
 ### PDF/HTML Reports
 
 ```bash
