@@ -8,14 +8,140 @@ import json
 import logging
 import os
 import sqlite3
+import stat
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger("world-intel-mcp.cache")
 
 _DEFAULT_DB = Path.home() / ".cache" / "world-intel-mcp" / "cache.db"
+
+
+class CachePathError(PermissionError):
+    """Unsafe cache storage must not be opened or silently replaced."""
+
+
+def _check_directory(info: os.stat_result, path: Path, *, sensitive: bool) -> None:
+    uid = os.geteuid()
+    if not stat.S_ISDIR(info.st_mode):
+        raise CachePathError(f"Unsafe cache directory (not a directory): {path}")
+    if info.st_uid not in ({uid} if sensitive else {0, uid}):
+        raise CachePathError(f"Unsafe cache directory ownership: {path}")
+    if info.st_mode & 0o022:
+        # A sticky ancestor such as /tmp can safely contain our owned child.
+        # The sensitive directory itself must never be shared-writable.
+        if sensitive or not info.st_mode & stat.S_ISVTX:
+            raise CachePathError(f"Unsafe writable cache directory: {path}")
+
+
+def _check_file(info: os.stat_result, path: Path) -> None:
+    if not stat.S_ISREG(info.st_mode):
+        raise CachePathError(f"Unsafe cache file (not a regular file): {path}")
+    if info.st_uid != os.geteuid() or info.st_nlink != 1:
+        raise CachePathError(f"Unsafe cache file ownership or hard links: {path}")
+    if info.st_mode & 0o022:
+        raise CachePathError(f"Unsafe writable cache file: {path}")
+
+
+@contextmanager
+def _secure_cache_file(path: Path, *, private_dir: bool):
+    """Prepare POSIX storage without following untrusted symlinks or chmodding them.
+
+    Walk directories through pinned descriptors. SQLite must still open by
+    pathname for its sidecars: this does not defend against concurrent path
+    replacement by this UID/root, or filesystems ignoring POSIX permissions.
+    """
+    if os.name != "posix" or not hasattr(os, "O_NOFOLLOW"):
+        raise CachePathError("Secure cache storage requires POSIX O_NOFOLLOW support")
+    absolute = path.absolute()
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory_fd = os.open(absolute.anchor, directory_flags)
+    file_fd = None
+    try:
+        _check_directory(os.fstat(directory_fd), Path(absolute.anchor), sensitive=False)
+        current = Path(absolute.anchor)
+        for part in absolute.parent.parts[1:]:
+            current /= part
+            try:
+                info = os.stat(part, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(part, mode=0o700, dir_fd=directory_fd)
+                except FileExistsError:
+                    pass  # another process created it; verify rather than trust
+                info = os.stat(part, dir_fd=directory_fd, follow_symlinks=False)
+            sensitive = current == absolute.parent
+            _check_directory(info, current, sensitive=sensitive)
+            child_fd = os.open(part, directory_flags, dir_fd=directory_fd)
+            try:
+                opened = os.fstat(child_fd)
+                _check_directory(opened, current, sensitive=sensitive)
+                if (info.st_dev, info.st_ino) != (opened.st_dev, opened.st_ino):
+                    raise CachePathError(f"Cache directory changed during verification: {current}")
+            except BaseException:
+                os.close(child_fd)
+                raise
+            os.close(directory_fd)
+            directory_fd = child_fd
+        # Also covers a database placed directly under the filesystem root.
+        _check_directory(os.fstat(directory_fd), absolute.parent, sensitive=True)
+        if private_dir:
+            os.fchmod(directory_fd, 0o700)
+
+        for name in (absolute.name, absolute.name + "-wal", absolute.name + "-shm",
+                     absolute.name + "-journal"):
+            is_database = name == absolute.name
+            try:
+                info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                if not is_database:
+                    continue
+                try:
+                    fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                 0o600, dir_fd=directory_fd)
+                except FileExistsError:
+                    info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                else:
+                    os.close(fd)
+                    info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            _check_file(info, absolute.parent / name)
+            try:
+                fd = os.open(name, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
+            except FileNotFoundError:
+                if not is_database:
+                    continue  # SQLite may remove sidecars on another connection's close
+                raise
+            try:
+                opened = os.fstat(fd)
+                if (
+                    not is_database
+                    and opened.st_nlink == 0
+                    and stat.S_ISREG(opened.st_mode)
+                    and opened.st_uid == os.geteuid()
+                ):
+                    # The last SQLite connection may unlink a sidecar after
+                    # our open. It is no longer reachable; do not chmod it.
+                    continue
+                _check_file(opened, absolute.parent / name)
+                if is_database and (info.st_dev, info.st_ino) != (opened.st_dev, opened.st_ino):
+                    raise CachePathError(f"Cache file changed during verification: {absolute.parent / name}")
+                # Sidecars may have been recreated between stat/open by a
+                # concurrent connection. Their opened inode must independently
+                # pass every safety check above, but need not be the old inode.
+                os.fchmod(fd, 0o600)
+                if is_database:
+                    file_fd, fd = fd, None
+            finally:
+                if fd is not None:
+                    os.close(fd)
+        yield absolute
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        os.close(directory_fd)
 
 
 def _default_db_path() -> Path:
@@ -30,27 +156,42 @@ class Cache:
     """SQLite-backed TTL cache."""
 
     def __init__(self, db_path: Path | None = None):
-        explicit_path = db_path is not None
-        self.db_path = Path(db_path) if db_path is not None else _default_db_path()
+        explicit_path = db_path is not None or bool(
+            os.environ.get("WORLD_INTEL_CACHE_DB") or os.environ.get("XDG_CACHE_HOME")
+        )
+        self.db_path = (Path(db_path) if db_path is not None else _default_db_path()).absolute()
+        self._private_dir = db_path is None and not os.environ.get("WORLD_INTEL_CACHE_DB")
         self._conn: sqlite3.Connection | None = None
         try:
             self._init_db()
+        except CachePathError:
+            self.close()
+            raise
         except (OSError, sqlite3.OperationalError) as exc:
+            self.close()
             if explicit_path:
                 raise
-            fallback = Path(tempfile.gettempdir()) / "world-intel-mcp" / "cache.db"
+            # Canonicalize only the system-selected temp root (e.g. /tmp is a
+            # root-managed alias on macOS), never the untrusted cache leaf.
+            fallback = Path(tempfile.gettempdir()).resolve() / f"world-intel-mcp-{os.geteuid()}" / "cache.db"
             logger.warning(
                 "Cache unavailable at %s: %s; falling back to %s",
                 self.db_path,
                 exc,
                 fallback,
             )
-            self.close()
             self.db_path = fallback
-            self._init_db()
+            self._private_dir = True
+            try:
+                self._init_db()
+            except BaseException:
+                self.close()
+                raise
+        except BaseException:
+            self.close()
+            raise
 
     def _init_db(self) -> None:
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = self._get_conn()
         conn.execute("""
             CREATE TABLE IF NOT EXISTS cache (
@@ -64,22 +205,36 @@ class Cache:
             "CREATE INDEX IF NOT EXISTS idx_cache_expires ON cache(expires_at)"
         )
         conn.commit()
-        # Owner-only permissions: the cache is trusted-by-design (whatever
-        # is in it gets served as intelligence, including to AOI briefs),
-        # so keep other local users from writing — or reading — it. The
-        # -wal/-shm sidecars inherit the db file's mode. Best-effort:
-        # non-POSIX filesystems may refuse.
-        try:
-            os.chmod(self.db_path, 0o600)
-        except OSError:
-            logger.debug("Could not chmod cache db at %s", self.db_path)
 
     def _get_conn(self) -> sqlite3.Connection:
         if self._conn is None:
-            self._conn = sqlite3.connect(str(self.db_path), timeout=10)
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA busy_timeout=5000")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
+            with _secure_cache_file(self.db_path, private_dir=self._private_dir) as path:
+                # mode=rw prevents SQLite recreating a missing main file with
+                # umask-dependent permissions after our exclusive 0600 creation.
+                conn = sqlite3.connect(path.as_uri() + "?mode=rw", uri=True, timeout=10)
+                try:
+                    conn.execute("PRAGMA busy_timeout=5000")
+                    # Concurrent first opens can both attempt the WAL mode
+                    # transition. SQLite may return BUSY immediately for that
+                    # PRAGMA despite busy_timeout; retry only lock contention.
+                    deadline = time.monotonic() + 5
+                    while True:
+                        try:
+                            conn.execute("PRAGMA journal_mode=WAL")
+                            break
+                        except sqlite3.OperationalError as exc:
+                            code = getattr(exc, "sqlite_errorcode", 0) & 0xff
+                            if (
+                                code not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+                                or time.monotonic() >= deadline
+                            ):
+                                raise
+                            time.sleep(0.01)
+                    conn.execute("PRAGMA synchronous=NORMAL")
+                except BaseException:
+                    conn.close()
+                    raise
+                self._conn = conn
         return self._conn
 
     def get(self, key: str) -> Any | None:

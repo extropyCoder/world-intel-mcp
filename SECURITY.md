@@ -59,6 +59,39 @@ OSINT feeds. Its trust boundaries:
    and circuit-breaker state is visible via `intel_status`. Consumers
    that must not act on stale data must check the marker.
 
+## Cache filesystem boundary
+
+On POSIX systems the cache creates new directories with mode `0700` and its
+database with `0600` **before** SQLite opens it. SQLite WAL/SHM files inherit
+the database's restrictive mode. Existing main/WAL/SHM/journal files must be
+regular, singly linked, owned by the current effective UID, and not writable
+by group/others. Verified owned files with read-only group/other access are
+tightened through their file descriptors before opening SQLite. Unsafe paths
+are refused, not repaired or silently bypassed.
+
+Directory components may not be symlinks, foreign-owned, or shared-writable;
+root-owned ancestors and sticky shared ancestors (such as `/tmp`) are allowed.
+The immediate database directory must be owned by the current UID and not
+shared-writable. Existing explicit parent directories need not be `0700` and
+are not chmodded; dedicated default/fallback directories are made private.
+Use canonical directory paths where system aliases are symlinks.
+
+If the ordinary home-cache location is unavailable, the fallback is
+`<system-temp>/world-intel-mcp-<effective-uid>/cache.db`, with verified ownership
+and a private directory. The old shared `world-intel-mcp/cache.db` is never
+used. A precreated unsafe UID-specific directory blocks fallback rather than
+being trusted. Fallback is reused across runs but remains subject to system
+temporary-file cleanup; the application performs no automatic cleanup.
+Explicit `db_path`, `WORLD_INTEL_CACHE_DB`, and `XDG_CACHE_HOME` failures now
+surface to the caller instead of silently selecting different storage.
+
+Directory descriptors and no-follow opens reduce path races, but SQLite still
+opens by pathname to manage its sidecars. This does not protect against root
+or same-UID path replacement, non-POSIX permission behavior, or permissive ACLs
+not reflected in mode bits. POSIX no-follow/descriptor support is required;
+unsupported platforms fail closed. AOI connections share the path prepared by
+`Cache`; independently constructed AOI stores are not hardened by this change.
+
 ## Upstream response limits
 
 GET bodies are streamed with cumulative **decoded-byte** caps: 32 MiB for
