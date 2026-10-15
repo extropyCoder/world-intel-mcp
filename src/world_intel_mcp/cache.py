@@ -15,6 +15,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from .diagnostics import exception_summary
+
 logger = logging.getLogger("world-intel-mcp.cache")
 
 _DEFAULT_DB = Path.home() / ".cache" / "world-intel-mcp" / "cache.db"
@@ -177,7 +179,7 @@ class Cache:
             logger.warning(
                 "Cache unavailable at %s: %s; falling back to %s",
                 self.db_path,
-                exc,
+                exception_summary(exc),
                 fallback,
             )
             self.db_path = fallback
@@ -288,7 +290,7 @@ class Cache:
             )
             conn.commit()
         except sqlite3.OperationalError as exc:
-            logger.warning("Cache write failed for %s: %s", key, exc)
+            logger.warning("Cache write failed: %s", exception_summary(exc))
 
     def delete(self, key: str) -> None:
         """Delete a specific key."""
@@ -306,7 +308,7 @@ class Cache:
             conn.commit()
             return cursor.rowcount
         except sqlite3.OperationalError as exc:
-            logger.warning("Cache evict failed: %s", exc)
+            logger.warning("Cache evict failed: %s", exception_summary(exc))
             return 0
 
     def stats(self) -> dict[str, Any]:

@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 from importlib.util import find_spec
 from typing import Any
 
+from .diagnostics import exception_summary, safe_error
+
 logger = logging.getLogger("world-intel-mcp.vector-store")
 
 # ---------------------------------------------------------------------------
@@ -365,13 +367,13 @@ class VectorStore:
                 try:
                     await asyncio.to_thread(self._store_sync, domain, data, timestamp)
                 except Exception as exc:
-                    logger.warning("Vector store write failed: %s", exc)
+                    logger.warning("Vector store write failed: %s", exception_summary(exc))
                 finally:
                     self._store_queue.task_done()
             except asyncio.CancelledError:
                 return
             except Exception as exc:
-                logger.warning("Vector store worker error: %s", exc)
+                logger.warning("Vector store worker error: %s", exception_summary(exc))
                 await asyncio.sleep(1)
 
     def _store_sync(self, domain: str, data: Any, timestamp: float) -> None:
@@ -505,7 +507,7 @@ class VectorStore:
             )
         except Exception as exc:
             return {
-                "error": str(exc),
+                "error": safe_error(exc),
                 "query": query,
                 "results": [],
                 "count": 0,
@@ -585,7 +587,7 @@ class VectorStore:
             return await asyncio.to_thread(self._similar_sync, domain, text, limit, hours)
         except Exception as exc:
             return {
-                "error": str(exc),
+                "error": safe_error(exc),
                 "reference_domain": domain,
                 "reference_text": text[:200],
                 "similar": [],
@@ -649,7 +651,7 @@ class VectorStore:
             )
         except Exception as exc:
             return {
-                "error": str(exc),
+                "error": safe_error(exc),
                 "hours": hours,
                 "entries": [],
                 "count": 0,
@@ -717,7 +719,7 @@ class VectorStore:
         try:
             return await asyncio.to_thread(self._stats_sync)
         except Exception as exc:
-            return {"error": str(exc), "enabled": self.enabled}
+            return {"error": safe_error(exc), "enabled": self.enabled}
 
     def _stats_sync(self) -> dict:
         client = _get_qdrant()
@@ -754,7 +756,7 @@ class VectorStore:
             )
         except Exception as exc:
             return {
-                "error": str(exc),
+                "error": safe_error(exc),
                 "query": query,
                 "hours": hours,
                 "domains_found": 0,
@@ -837,7 +839,7 @@ class VectorStore:
             return await asyncio.to_thread(self._domain_summary_sync, hours)
         except Exception as exc:
             return {
-                "error": str(exc),
+                "error": safe_error(exc),
                 "hours": hours,
                 "total_data_points": 0,
                 "categories": 0,
@@ -944,7 +946,7 @@ class VectorStore:
             )
         except Exception as exc:
             return {
-                "error": str(exc),
+                "error": safe_error(exc),
                 "recent_window_hours": recent_hours,
                 "baseline_window_hours": baseline_hours,
                 "categories_analyzed": 0,

@@ -27,6 +27,7 @@ from world_intel_mcp.analysis.aoi import AOIStore
 from world_intel_mcp.cache import Cache
 from world_intel_mcp.circuit_breaker import CircuitBreaker
 from world_intel_mcp.fetcher import Fetcher
+from world_intel_mcp.diagnostics import exception_summary, safe_error, sanitize_error_fields
 from world_intel_mcp.sources import (
     markets,
     seismology,
@@ -316,8 +317,8 @@ async def _fetch_overview() -> dict:
     result: dict = {}
     for name, data in zip(coros.keys(), gathered):
         if isinstance(data, Exception):
-            logger.warning("Dashboard fetch %s failed: %s", name, data)
-            result[name] = {"error": type(data).__name__ + ": " + str(data)[:120]}
+            logger.warning("Dashboard fetch %s failed: %s", name, exception_summary(data))
+            result[name] = {"error": exception_summary(data)[:120]}
         else:
             result[name] = data
 
@@ -370,8 +371,8 @@ async def _fetch_overview() -> dict:
             timeout=35.0,
         )
     except Exception as exc:
-        logger.warning("Situation brief failed: %s", exc)
-        result["situation_brief"] = {"error": str(exc)}
+        logger.warning("Situation brief failed: %s", exception_summary(exc))
+        result["situation_brief"] = {"error": safe_error(exc)}
 
     # Attach source health + timestamp
     result["source_health"] = _breaker.status() if _breaker else {}
@@ -396,7 +397,7 @@ async def index(request):
 async def api_overview(request):
     """REST endpoint — full snapshot of all intelligence domains."""
     data = await _fetch_overview()
-    return JSONResponse(data)
+    return JSONResponse(sanitize_error_fields(data))
 
 
 _CONFLICT_FEEDS = ("acled_events", "ucdp_events")
@@ -510,8 +511,8 @@ async def api_stream(request):
                     except asyncio.TimeoutError:
                         data = {"error": f"timeout after {timeout}s", "_timeout": True}
                     except Exception as exc:
-                        data = {"error": f"{type(exc).__name__}: {str(exc)[:120]}"}
-                    await results_q.put((name, data))
+                        data = {"error": exception_summary(exc)[:120]}
+                    await results_q.put((name, sanitize_error_fields(data)))
 
                 # Fire all sources concurrently
                 tasks = [
@@ -581,8 +582,8 @@ async def api_stream(request):
             except asyncio.CancelledError:
                 return
             except Exception as exc:
-                logger.exception("SSE tick failed")
-                yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+                logger.error("SSE tick failed: %s", exception_summary(exc))
+                yield f"data: {json.dumps({'error': safe_error(exc)})}\n\n"
             await asyncio.sleep(30)
 
     return StreamingResponse(
@@ -670,9 +671,9 @@ async def api_aois(request):
         finally:
             store.close()
     except Exception as exc:
-        logger.warning("AOI layer unavailable: %s", exc)
+        logger.warning("AOI layer unavailable: %s", exception_summary(exc))
         return JSONResponse(
-            {"error": f"AOI store unavailable: {exc}", "aois": [], "count": 0},
+            {"error": f"AOI store unavailable: {safe_error(exc)}", "aois": [], "count": 0},
             status_code=503,
         )
     return JSONResponse(
@@ -746,13 +747,13 @@ async def api_migration(request):
             migration.wb_countries(fetcher),
         )
     except Exception as exc:
-        logger.warning("Migration layer unavailable: %s", exc)
+        logger.warning("Migration layer unavailable: %s", exception_summary(exc))
         return JSONResponse(
-            {"error": f"Migration fetch failed: {exc}", "corridors": [], "rising": []},
+            {"error": f"Migration fetch failed: {safe_error(exc)}", "corridors": [], "rising": []},
             status_code=503,
         )
     if "error" in flows:
-        return JSONResponse({**flows, "corridors": [], "rising": []}, status_code=503)
+        return JSONResponse(sanitize_error_fields({**flows, "corridors": [], "rising": []}), status_code=503)
     if wb is None:
         return JSONResponse(
             {"error": "World Bank country coordinates unavailable", "source": "worldbank",
@@ -777,7 +778,8 @@ async def api_migration(request):
         "timestamp": flows["timestamp"],
     }
     if "error" in surges:
-        payload.update(rising=[], rising_unplotted=0, rising_error=surges["error"])
+        payload.update(rising=[], rising_unplotted=0,
+                       rising_error=sanitize_error_fields({"error": surges["error"]})["error"])
     else:
         rising, rising_unplotted = _place_corridors(surges["corridor_increases"], wb)
         payload.update(rising=rising, rising_unplotted=len(rising_unplotted),
@@ -804,13 +806,13 @@ async def sse_vector_analytics(request):
     async def event_generator():
         while True:
             try:
-                payload = await _fetch_vector_analytics()
+                payload = sanitize_error_fields(await _fetch_vector_analytics())
                 yield f"data: {json.dumps(payload, default=str)}\n\n"
             except asyncio.CancelledError:
                 return
             except Exception as exc:
-                logger.exception("Vector analytics SSE tick failed")
-                yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+                logger.error("Vector analytics SSE tick failed: %s", exception_summary(exc))
+                yield f"data: {json.dumps({'error': safe_error(exc)})}\n\n"
             await asyncio.sleep(30)
 
     return StreamingResponse(
@@ -845,8 +847,8 @@ async def _fetch_vector_analytics() -> dict:
     names = ("stats", "domain_summary", "trends")
     for name, data in zip(names, gathered):
         if isinstance(data, Exception):
-            logger.warning("Vector analytics %s failed: %s", name, data)
-            result[name] = {"error": str(data)}
+            logger.warning("Vector analytics %s failed: %s", name, exception_summary(data))
+            result[name] = {"error": safe_error(data)}
         else:
             result[name] = data
     result["timestamp"] = datetime.now(timezone.utc).isoformat()
@@ -927,11 +929,11 @@ async def api_vector_search(request):
             )
         results = await _vector_store.semantic_search(**arguments)
         if isinstance(results, dict) and "error" in results:
-            logger.error("Vector search failed: %s", results["error"])
+            logger.error("Vector search failed: %s", sanitize_error_fields({"error": results["error"]})["error"])
             return JSONResponse({"error": "Vector search failed"}, status_code=500)
         return JSONResponse(results)
-    except Exception:
-        logger.exception("Vector search failed")
+    except Exception as exc:
+        logger.error("Vector search failed: %s", exception_summary(exc))
         return JSONResponse(
             {"error": "Vector search failed"},
             status_code=500,

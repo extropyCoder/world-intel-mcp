@@ -32,6 +32,7 @@ logger = logging.getLogger("world-intel-collector")
 from .cache import Cache
 from .circuit_breaker import CircuitBreaker
 from .fetcher import Fetcher
+from .diagnostics import exception_summary, safe_error
 from .vector_store import VectorStore
 
 # All fetchable sources grouped by domain.
@@ -233,7 +234,7 @@ async def collect_once(
         except asyncio.TimeoutError:
             return name, None, f"timeout ({budget}s)"
         except Exception as exc:
-            return name, None, str(exc)[:120]
+            return name, None, safe_error(exc)[:120]
 
     tasks = [_fetch_one(name, mod, fn, kw) for name, mod, fn, kw in sources_to_run]
 
@@ -246,7 +247,7 @@ async def collect_once(
     for item in results:
         if isinstance(item, Exception):
             failures += 1
-            errors.append(str(item)[:100])
+            errors.append(safe_error(item)[:100])
             continue
         name, data, error = item
         if error:
@@ -323,7 +324,7 @@ async def run_daemon(
             summary = await collect_once(fetcher, vector_store, resolved_filter)
             logger.info("Cycle %d complete: %s", cycle, summary)
         except Exception as exc:
-            logger.error("Cycle %d failed: %s", cycle, exc)
+            logger.error("Cycle %d failed: %s", cycle, exception_summary(exc))
 
         # Evict expired cache entries periodically
         if cycle % 12 == 0:  # Every ~hour at 5min interval

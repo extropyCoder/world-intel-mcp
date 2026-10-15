@@ -14,6 +14,7 @@ import logging
 from datetime import datetime, timezone
 
 from ..fetcher import Fetcher
+from ..diagnostics import exception_summary
 
 logger = logging.getLogger("world-intel-mcp.sources.space_weather")
 
@@ -187,7 +188,7 @@ async def fetch_space_weather(fetcher: Fetcher) -> dict:
                 if flux is not None:
                     result["latest_flare_class"] = _classify_xray(float(flux))
         except (ValueError, TypeError, KeyError) as exc:
-            logger.warning("Failed to parse X-ray flux: %s", exc)
+            logger.warning("Failed to parse X-ray flux: %s", exception_summary(exc))
 
     # --- Alerts ---
     if alerts_data and isinstance(alerts_data, list):

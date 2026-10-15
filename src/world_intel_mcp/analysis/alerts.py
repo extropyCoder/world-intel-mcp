@@ -11,6 +11,8 @@ import math
 import sqlite3
 from datetime import datetime, timezone
 
+from ..diagnostics import exception_summary
+
 logger = logging.getLogger("world-intel-mcp.analysis.alerts")
 
 
@@ -27,7 +29,7 @@ async def _safe_fetch(coro, label: str) -> dict:
     try:
         return await coro
     except Exception as exc:
-        logger.warning("Alert digest: %s failed: %s", label, exc)
+        logger.warning("Alert digest: %s failed: %s", label, exception_summary(exc))
         return {}
 
 
@@ -295,7 +297,7 @@ async def fetch_weekly_trends(fetcher) -> dict:
             })
 
     except (sqlite3.Error, OSError) as exc:
-        logger.warning("Failed to read temporal baselines: %s", exc)
+        logger.warning("Failed to read temporal baselines: %s", exception_summary(exc))
 
     # Sort by volatility descending
     trends.sort(key=lambda t: t.get("volatility_cv", 0), reverse=True)

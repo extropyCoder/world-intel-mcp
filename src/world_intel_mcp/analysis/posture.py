@@ -10,6 +10,8 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
+from ..diagnostics import exception_summary
+
 logger = logging.getLogger("world-intel-mcp.analysis.posture")
 
 
@@ -31,7 +33,7 @@ async def _safe(coro, label: str) -> dict:
     try:
         return await coro
     except Exception as exc:
-        logger.warning("Posture: %s failed: %s", label, exc)
+        logger.warning("Posture: %s failed: %s", label, exception_summary(exc))
         return {}
 
 

@@ -229,3 +229,67 @@ def test_readme_documents_every_registered_tool(server) -> None:
     n = len(server.TOOLS)
     assert f"**{n} MCP tools**" in readme
     assert f"**Total: {n} tools**" in readme
+
+
+@pytest.mark.asyncio
+async def test_call_tool_logs_redacted_copies_and_sanitizes_error_fields(server, monkeypatch, caplog):
+    import copy
+    import json
+    import logging
+    from unittest.mock import AsyncMock
+
+    secrets = ["DUMMY_TOOL_API_KEY", "DUMMY_NESTED_TOKEN", "DUMMY_HEADER_PASSWORD",
+               "DUMMY_URL_USER", "DUMMY_URL_PASSWORD", "DUMMY_URL_PATH_KEY"]
+    url = f"https://{secrets[3]}:{secrets[4]}@source.test/api/{secrets[5]}?API%5fKEY={secrets[0]}"
+    arguments = {"region": "europe", "api_key": secrets[0],
+                 "nested": [{"Auth%6Frization": f"Bearer {secrets[1]}",
+                             "credentials": {"password": secrets[2]}, "url": url}]}
+    before = copy.deepcopy(arguments)
+    result = {"error": {"message": f"failed {url}", "headers": {"Authorization": secrets[1]},
+                        "api_key": {"value": secrets[0]}, "credentials": [{"password": secrets[2]}]},
+              "nested": {"errors": [{"headers": [{"Auth%6Frization": secrets[1]}],
+                                     "API%5fKEY": [secrets[0]], "message": "upstream failed"}]},
+              "normal_data": {"value": 42, "api_key": "ordinary-data",
+                              "headers": {"Authorization": "unchanged"}}}
+    original_result = copy.deepcopy(result)
+    dispatch = AsyncMock(return_value=result)
+    monkeypatch.setattr(server, "_dispatch", dispatch)
+    with caplog.at_level(logging.INFO):
+        contents = await server.call_tool("intel_wildfires", arguments)
+    rendered = caplog.text + contents[0].text
+    for secret in secrets:
+        assert secret not in rendered
+    assert "intel_wildfires" in caplog.text and "europe" in caplog.text
+    assert "REDACTED" in caplog.text
+    dispatch.assert_awaited_once_with("intel_wildfires", arguments)
+    assert dispatch.await_args.args[1] is arguments  # actual caller object unchanged
+    assert arguments == before and result == original_result
+    output = json.loads(contents[0].text)
+    assert output["normal_data"] == original_result["normal_data"]
+    assert output["error"]["headers"]["Authorization"] == "[REDACTED]"
+    assert output["nested"]["errors"][0]["message"] == "upstream failed"
+
+
+@pytest.mark.asyncio
+async def test_call_tool_exception_does_not_render_credential_traceback(server, monkeypatch, caplog):
+    import json
+    import logging
+    import httpx
+
+    secret = "DUMMY_CHAINED_HTTP_SECRET"
+    request = httpx.Request("GET", f"https://service.test/{secret}?api_key={secret}")
+    response = httpx.Response(403, request=request)
+
+    async def dispatch(*args):
+        try:
+            raise httpx.HTTPStatusError(secret, request=request, response=response)
+        except httpx.HTTPStatusError as exc:
+            raise RuntimeError("tool operation failed") from exc
+
+    monkeypatch.setattr(server, "_dispatch", dispatch)
+    with caplog.at_level(logging.INFO):
+        contents = await server.call_tool("intel_wildfires", {"api_key": secret})
+    assert secret not in caplog.text + contents[0].text
+    assert "RuntimeError" in caplog.text and "intel_wildfires" in caplog.text
+    assert json.loads(contents[0].text)["error"] == "tool operation failed"
+    assert all(record.exc_info is None for record in caplog.records)

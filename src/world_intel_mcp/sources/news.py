@@ -12,6 +12,7 @@ import string
 from datetime import datetime, timezone
 
 from ..fetcher import Fetcher
+from ..diagnostics import safe_url
 
 try:
     import feedparser
@@ -588,7 +589,7 @@ async def fetch_news_feed(
         )
 
         if xml_text is None:
-            logger.debug("No data from RSS feed %s (%s)", feed_name, url)
+            logger.debug("No data from RSS feed %s (%s)", feed_name, safe_url(url))
             return []
 
         parsed = feedparser.parse(xml_text)

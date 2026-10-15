@@ -10,6 +10,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 
 from ..fetcher import Fetcher
+from ..diagnostics import exception_summary
 
 logger = logging.getLogger("world-intel-mcp.sources.earnings")
 
@@ -188,7 +189,7 @@ async def fetch_earnings_calendar(
                 "eps_previous": eps_previous,
             }
         except (KeyError, IndexError, TypeError) as exc:
-            logger.warning("Failed to parse earnings for %s: %s", symbol, exc)
+            logger.warning("Failed to parse earnings for %s: %s", symbol, exception_summary(exc))
             return None
 
     # Batch requests to respect rate limits

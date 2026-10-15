@@ -13,6 +13,8 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
+from ..diagnostics import exception_summary, safe_error
+
 logger = logging.getLogger("world-intel-mcp.analysis.dossier")
 
 # Minimal ISO-2 <-> ISO-3 mapping for the 22 tier-1 countries + major extras.
@@ -54,8 +56,8 @@ async def _safe(coro, label: str) -> dict:
     try:
         return await coro
     except Exception as exc:
-        logger.warning("Dossier: %s failed: %s", label, exc)
-        return {"_error": str(exc)}
+        logger.warning("Dossier: %s failed: %s", label, exception_summary(exc))
+        return {"_error": safe_error(exc)}
 
 
 async def fetch_country_dossier(

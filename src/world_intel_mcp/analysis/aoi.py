@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Any
 
 from .escalation import score_hotspot
+from ..diagnostics import exception_summary, safe_error
 from .situation import _add_source, _cite, _has_valid_citation
 
 logger = logging.getLogger("world-intel-mcp.analysis.aoi")
@@ -1117,8 +1118,8 @@ async def _safe_fetch(coro, label: str) -> dict:
         result = await coro
         return result if isinstance(result, dict) else {}
     except Exception as exc:
-        logger.warning("AOI brief: %s failed: %s", label, exc)
-        return {"error": str(exc)}
+        logger.warning("AOI brief: %s failed: %s", label, exception_summary(exc))
+        return {"error": safe_error(exc)}
 
 
 async def _fetch_wildfires_for_aoi(fetcher, wildfire_regions: list[str]) -> dict:
@@ -1997,7 +1998,7 @@ async def _notify_aoi_changes(fetcher, digest: dict) -> dict:
                 },
             )
     except Exception as exc:
-        return {"configured": True, "sent": False, "error": str(exc)[:200]}
+        return {"configured": True, "sent": False, "error": safe_error(exc)[:200]}
     return {
         "configured": True,
         "sent": 200 <= resp.status_code < 300,

@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 
 import httpx
 
+from ..diagnostics import exception_summary, safe_error
+
 logger = logging.getLogger("world-intel-mcp.analysis.situation")
 
 _CITATION_RE = re.compile(r"\[(\d+)\]")
@@ -444,7 +446,7 @@ async def fetch_situation_brief(overview_data: dict) -> dict:
                 ai_generated = True
                 used_model = model
     except Exception as exc:
-        logger.debug("Ollama unavailable for situation brief: %s", exc)
+        logger.debug("Ollama unavailable for situation brief: %s", exception_summary(exc))
 
     if not brief_text:
         brief_text = _fallback_brief(metrics, citations)
@@ -492,8 +494,8 @@ async def _safe_fetch(coro, label: str) -> dict:
         result = await coro
         return result if isinstance(result, dict) else {}
     except Exception as exc:
-        logger.warning("Situation brief overview: %s failed: %s", label, exc)
-        return {"error": str(exc)}
+        logger.warning("Situation brief overview: %s failed: %s", label, exception_summary(exc))
+        return {"error": safe_error(exc)}
 
 
 async def _gather_compact_overview(fetcher) -> dict:

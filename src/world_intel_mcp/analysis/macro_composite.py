@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 
 from ..fetcher import Fetcher
 
+from ..diagnostics import exception_summary
+
 logger = logging.getLogger("world-intel-mcp.analysis.macro_composite")
 
 # Signal weights (sum to 1.0)
@@ -132,7 +134,7 @@ async def _safe(coro, label: str):
     try:
         return await coro
     except Exception as exc:
-        logger.warning("MacroComposite: %s failed: %s", label, exc)
+        logger.warning("MacroComposite: %s failed: %s", label, exception_summary(exc))
         return {}
 
 

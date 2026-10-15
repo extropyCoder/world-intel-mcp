@@ -11,6 +11,7 @@ import os
 from datetime import datetime, timezone
 
 from ..fetcher import Fetcher
+from ..diagnostics import exception_summary
 
 logger = logging.getLogger("world-intel-mcp.sources.bonds")
 
@@ -217,7 +218,7 @@ async def _fetch_yields_from_fred(
                     if val not in (None, ".", ""):
                         rate = float(val)
             except (KeyError, TypeError, ValueError, IndexError) as exc:
-                logger.warning("Failed to parse FRED %s: %s", series_id, exc)
+                logger.warning("Failed to parse FRED %s: %s", series_id, exception_summary(exc))
         return {"maturity": maturity, "rate": rate, "date": date, "series": series_id}
 
     tasks = [

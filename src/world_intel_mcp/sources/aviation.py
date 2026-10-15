@@ -12,6 +12,7 @@ import os
 from datetime import datetime, timezone
 
 from ..fetcher import Fetcher
+from ..diagnostics import exception_summary
 
 logger = logging.getLogger("world-intel-mcp.sources.aviation")
 
@@ -109,7 +110,7 @@ async def fetch_airport_delays(fetcher: Fetcher) -> dict:
 
     for result in results:
         if isinstance(result, Exception):
-            logger.warning("Exception fetching airport status: %s", result)
+            logger.warning("Exception fetching airport status: %s", exception_summary(result))
             errors += 1
             continue
 

@@ -10,6 +10,7 @@ import os
 from datetime import datetime, timezone
 
 from ..fetcher import Fetcher
+from ..diagnostics import exception_summary
 
 logger = logging.getLogger("world-intel-mcp.sources.traffic")
 
@@ -107,7 +108,7 @@ async def fetch_traffic_flow(fetcher: Fetcher) -> dict:
     cities = []
     for r in results:
         if isinstance(r, Exception):
-            logger.warning("Traffic flow fetch failed: %s", r)
+            logger.warning("Traffic flow fetch failed: %s", exception_summary(r))
             continue
         if r.get("error"):
             continue
@@ -194,7 +195,7 @@ async def fetch_traffic_incidents(fetcher: Fetcher) -> dict:
     all_incidents = []
     for r in results:
         if isinstance(r, Exception):
-            logger.warning("Traffic incidents fetch failed: %s", r)
+            logger.warning("Traffic incidents fetch failed: %s", exception_summary(r))
             continue
         all_incidents.extend(r)
 

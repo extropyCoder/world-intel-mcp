@@ -199,3 +199,21 @@ async def test_wb_countries_reads_capital_coordinates() -> None:
     out = await migration.wb_countries(Stub())
     assert (out["SDN"]["latitude"], out["SDN"]["longitude"], out["SDN"]["capital"]) == (15.5932, 32.5363, "Khartoum")
     assert out["PSE"]["latitude"] is None and out["PSE"]["longitude"] is None and out["PSE"]["capital"] is None
+
+
+@pytest.mark.parametrize("part", ["flows", "surges"])
+def test_structured_upstream_errors_are_sanitized_copies(client, faked, part):
+    import copy
+    import json
+
+    error = {"message": "upstream failed", "headers": [{"Authorization": "DUMMY_MIGRATION_AUTH"}],
+             "api_key": [{"value": "DUMMY_MIGRATION_KEY"}]}
+    original = copy.deepcopy(error)
+    faked[part] = {"error": error}
+    response = client.get("/api/migration")
+    assert response.status_code == (503 if part == "flows" else 200)
+    output = response.json()["error" if part == "flows" else "rising_error"]
+    assert "DUMMY_MIGRATION" not in json.dumps(output)
+    assert output["message"] == "upstream failed"
+    assert output["api_key"] == "[REDACTED]"
+    assert error == original

@@ -9,6 +9,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from ..fetcher import Fetcher
+from ..diagnostics import exception_summary
 
 logger = logging.getLogger("world-intel-mcp.sources.sec_edgar")
 
@@ -127,7 +128,7 @@ async def fetch_sec_filings(
                 )
             result["filings"].append(filing)
     except (KeyError, TypeError, IndexError) as exc:
-        logger.warning("Failed to parse EFTS search results: %s", exc)
+        logger.warning("Failed to parse EFTS search results: %s", exception_summary(exc))
 
     return result
 
@@ -162,7 +163,7 @@ async def _resolve_cik(fetcher: Fetcher, ticker: str) -> tuple[str | None, str |
                 padded = cik.zfill(10)
                 return padded, entry.get("title", "")
     except (KeyError, TypeError, AttributeError) as exc:
-        logger.warning("Failed to resolve ticker %s: %s", ticker, exc)
+        logger.warning("Failed to resolve ticker %s: %s", ticker, exception_summary(exc))
 
     return None, None
 
@@ -259,7 +260,7 @@ async def fetch_company_filings(
             )
             count += 1
     except (KeyError, TypeError, IndexError) as exc:
-        logger.warning("Failed to parse submissions for %s: %s", ticker, exc)
+        logger.warning("Failed to parse submissions for %s: %s", ticker, exception_summary(exc))
 
     return result
 
@@ -358,6 +359,6 @@ async def fetch_recent_8k(
 
             result["filings"].append(filing)
     except (KeyError, TypeError, IndexError) as exc:
-        logger.warning("Failed to parse recent 8-K results: %s", exc)
+        logger.warning("Failed to parse recent 8-K results: %s", exception_summary(exc))
 
     return result

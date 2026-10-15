@@ -20,6 +20,7 @@ import logging
 from datetime import datetime, timezone
 
 from .situation import _add_source, _cite, _has_valid_citation
+from ..diagnostics import exception_summary, safe_error
 
 logger = logging.getLogger("world-intel-mcp.analysis.daily_digest")
 
@@ -42,8 +43,8 @@ async def _safe_fetch(coro, label: str) -> dict:
         result = await coro
         return result if isinstance(result, dict) else {}
     except Exception as exc:
-        logger.warning("Daily digest: %s failed: %s", label, exc)
-        return {"error": str(exc)}
+        logger.warning("Daily digest: %s failed: %s", label, exception_summary(exc))
+        return {"error": safe_error(exc)}
 
 
 async def _fetch_current_events(fetcher) -> tuple[dict, list[str]]:

@@ -16,6 +16,7 @@ from .analysis import aoi
 from .cache import Cache
 from .circuit_breaker import CircuitBreaker
 from .fetcher import Fetcher
+from .diagnostics import exception_summary
 
 logger = logging.getLogger("world-intel-mcp")
 
@@ -39,7 +40,7 @@ try:
             "Vector store unavailable (qdrant_client / fastembed not installed)"
         )
 except Exception as exc:
-    logger.info("Vector store unavailable: %s", exc)
+    logger.info("Vector store unavailable: %s", exception_summary(exc))
 
 vector_store = _vector_store
 

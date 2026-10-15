@@ -1955,7 +1955,7 @@ async def test_sweep_notification_failure_is_honest(
     assert result["count"] == 1  # sweep itself succeeded
     note = result["notification"]
     assert note["sent"] is False
-    assert "refused" in note["error"]
+    assert "ConnectError" in note["error"]
 
 
 @pytest.mark.asyncio

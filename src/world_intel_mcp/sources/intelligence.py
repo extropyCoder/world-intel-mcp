@@ -17,6 +17,7 @@ from datetime import datetime, timezone, timedelta
 import httpx
 
 from ..fetcher import Fetcher
+from ..diagnostics import exception_summary
 from .conflict import acled_query, acled_failure_reason
 from ..analysis.focal_points import detect_focal_points
 from ..analysis.signals import aggregate_country_signals
@@ -182,7 +183,7 @@ async def fetch_country_brief(
                             pass
         except (KeyError, TypeError, IndexError) as exc:
             logger.warning(
-                "Failed to parse World Bank GDP for %s: %s", country_code, exc
+                "Failed to parse World Bank GDP for %s: %s", country_code, exception_summary(exc)
             )
         return values
 
@@ -216,7 +217,7 @@ async def fetch_country_brief(
                             pass
         except (KeyError, TypeError, IndexError) as exc:
             logger.warning(
-                "Failed to parse World Bank inflation for %s: %s", country_code, exc
+                "Failed to parse World Bank inflation for %s: %s", country_code, exception_summary(exc)
             )
         return values
 
@@ -285,9 +286,9 @@ async def fetch_country_brief(
                 brief_text = generated.strip()
                 llm_available = True
     except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as exc:
-        logger.info("Ollama unavailable for country brief (%s): %s", country_code, exc)
+        logger.info("Ollama unavailable for country brief (%s): %s", country_code, exception_summary(exc))
     except Exception as exc:
-        logger.warning("Unexpected error calling Ollama: %s", exc)
+        logger.warning("Unexpected error calling Ollama: %s", exception_summary(exc))
 
     return {
         "country_code": country_code,

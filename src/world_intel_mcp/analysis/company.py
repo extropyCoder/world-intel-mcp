@@ -12,6 +12,7 @@ import logging
 from datetime import datetime, timezone
 
 from ..fetcher import Fetcher
+from ..diagnostics import exception_summary
 
 logger = logging.getLogger("world-intel-mcp.analysis.company")
 
@@ -32,7 +33,7 @@ async def _safe(coro, label: str):
     try:
         return await coro
     except Exception as exc:
-        logger.warning("Company: %s failed: %s", label, exc)
+        logger.warning("Company: %s failed: %s", label, exception_summary(exc))
         return None
 
 
@@ -157,7 +158,7 @@ async def _fetch_sec_filings(fetcher: Fetcher, ticker: str) -> list[dict] | None
         result = await fetch_company_filings(fetcher, ticker, limit=5)
         return result.get("filings", [])
     except Exception as exc:
-        logger.warning("SEC filings fetch failed for %s: %s", ticker, exc)
+        logger.warning("SEC filings fetch failed for %s: %s", ticker, exception_summary(exc))
         return None
 
 

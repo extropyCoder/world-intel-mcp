@@ -13,6 +13,7 @@ from datetime import datetime, timezone, timedelta
 import httpx
 
 from ..fetcher import Fetcher
+from ..diagnostics import exception_summary
 
 logger = logging.getLogger("world-intel-mcp.sources.conflict")
 
@@ -82,7 +83,7 @@ async def _acled_get_token() -> str | None:
             )
             return _acled_token
         except Exception as exc:
-            logger.warning("ACLED OAuth token request failed: %s", exc)
+            logger.warning("ACLED OAuth token request failed: %s", exception_summary(exc))
             # If refresh failed, try password grant as fallback
             if _acled_refresh_token and email and password:
                 _acled_refresh_token = None

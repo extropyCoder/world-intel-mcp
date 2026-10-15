@@ -8,6 +8,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from ..fetcher import Fetcher
+from ..diagnostics import exception_summary
 
 logger = logging.getLogger("world-intel-mcp.sources.forex")
 
@@ -162,7 +163,7 @@ async def fetch_forex_timeseries(
             }
     except (KeyError, TypeError, ValueError) as exc:
         logger.warning(
-            "Failed to parse ECB timeseries for %s/%s: %s", base, symbol, exc
+            "Failed to parse ECB timeseries for %s/%s: %s", base, symbol, exception_summary(exc)
         )
 
     return result
@@ -226,7 +227,7 @@ async def fetch_major_crosses(fetcher: Fetcher) -> dict:
             )
             dxy_proxy = round(product * 100, 4)
     except (TypeError, ValueError, ZeroDivisionError) as exc:
-        logger.warning("Failed to compute DXY proxy: %s", exc)
+        logger.warning("Failed to compute DXY proxy: %s", exception_summary(exc))
 
     return {
         "major_pairs": major_pairs,

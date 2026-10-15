@@ -11,6 +11,7 @@ import time
 from datetime import datetime, timezone
 
 from ..fetcher import Fetcher
+from ..diagnostics import exception_summary
 
 logger = logging.getLogger("world-intel-mcp.sources.economic")
 
@@ -99,7 +100,7 @@ async def fetch_energy_prices(
                 elif product == "EPCWTI" and result["oil"]["wti"] is None:
                     result["oil"]["wti"] = entry
         except (KeyError, TypeError, ValueError) as exc:
-            logger.warning("Failed to parse EIA oil data: %s", exc)
+            logger.warning("Failed to parse EIA oil data: %s", exception_summary(exc))
 
     # --- Parse natural gas price --------------------------------------------
     if gas_data:
@@ -115,7 +116,7 @@ async def fetch_energy_prices(
                         "date": period,
                     }
         except (KeyError, TypeError, ValueError) as exc:
-            logger.warning("Failed to parse EIA natural gas data: %s", exc)
+            logger.warning("Failed to parse EIA natural gas data: %s", exception_summary(exc))
 
     return result
 
@@ -277,7 +278,7 @@ async def fetch_gas_prices(
         try:
             html = await asyncio.to_thread(_fetch_aaa_html)
         except Exception as exc:
-            logger.warning("Failed to fetch AAA gas prices: %s", exc)
+            logger.warning("Failed to fetch AAA gas prices: %s", exception_summary(exc))
 
         if html:
             fetcher.cache.set("economic:gas_prices:aaa", html, ttl_seconds=1800)
@@ -322,7 +323,7 @@ async def fetch_gas_prices(
         result["prices"] = parsed["prices"]
         result["state_prices"] = parsed.get("state_prices", [])
     except Exception as exc:
-        logger.warning("Failed to parse AAA gas prices: %s", exc)
+        logger.warning("Failed to parse AAA gas prices: %s", exception_summary(exc))
 
     return result
 
@@ -396,7 +397,7 @@ async def fetch_residential_natgas_prices(
                     }
                 )
     except (KeyError, TypeError, ValueError) as exc:
-        logger.warning("Failed to parse EIA residential natgas data: %s", exc)
+        logger.warning("Failed to parse EIA residential natgas data: %s", exception_summary(exc))
 
     # Add change from previous period on the most recent entry
     if len(result["prices"]) >= 2:
@@ -503,7 +504,7 @@ async def fetch_electricity_rates(
                 entry["prev_period"] = entries[1]["period"]
             result["rates"][sector] = entry
     except (KeyError, TypeError, ValueError) as exc:
-        logger.warning("Failed to parse EIA electricity data: %s", exc)
+        logger.warning("Failed to parse EIA electricity data: %s", exception_summary(exc))
 
     return result
 
@@ -586,7 +587,7 @@ async def fetch_fred_series(
         if "realtime_end" in data:
             result["realtime_end"] = data["realtime_end"]
     except (KeyError, TypeError) as exc:
-        logger.warning("Failed to parse FRED series %s: %s", series_id, exc)
+        logger.warning("Failed to parse FRED series %s: %s", series_id, exception_summary(exc))
 
     return result
 
@@ -682,7 +683,7 @@ async def fetch_world_bank_indicators(
                 "Failed to parse World Bank indicator %s for %s: %s",
                 indicator_id,
                 country,
-                exc,
+                exception_summary(exc),
             )
 
         parsed_indicators.append(entry)

@@ -4,7 +4,7 @@ Renders multi-domain intelligence summaries as styled PDF documents
 using WeasyPrint. Data is pulled from the same source modules and
 analysis engines used by the MCP server and dashboard.
 
-Optional dependency: ``pip install -e ".[pdf]"`` (weasyprint>=62.0).
+Optional dependency: ``pip install -e ".[pdf]"`` (weasyprint>=70.0).
 Requires native pango/gobject libs (``brew install pango`` on macOS).
 """
 
@@ -20,6 +20,7 @@ from typing import Any
 from .cache import Cache
 from .circuit_breaker import CircuitBreaker
 from .fetcher import Fetcher
+from .diagnostics import exception_summary, safe_error
 from .sources import (
     markets,
     seismology,
@@ -531,8 +532,8 @@ async def _safe_fetch(name: str, fn) -> dict:
         result = await fn()
         return result if isinstance(result, dict) else {"data": result}
     except Exception as exc:
-        logger.warning("Report section '%s' failed: %s", name, exc)
-        return {"error": str(exc)}
+        logger.warning("Report section '%s' failed: %s", name, exception_summary(exc))
+        return {"error": safe_error(exc)}
 
 
 # ---------------------------------------------------------------------------

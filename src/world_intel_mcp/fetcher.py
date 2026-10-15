@@ -17,6 +17,7 @@ import httpx
 
 from .cache import Cache
 from .circuit_breaker import CircuitBreaker
+from .diagnostics import exception_summary, redact_text, safe_error, safe_url
 
 logger = logging.getLogger("world-intel-mcp.fetcher")
 
@@ -255,7 +256,7 @@ class Fetcher:
 
         # Check circuit breaker — fall back to stale data if open
         if not self.breaker.is_available(source):
-            logger.debug("Circuit open for %s, trying stale cache", source)
+            logger.debug("Circuit open for %s, trying stale cache", redact_text(source))
             return self._stale_fallback(effective_key, source)
 
         # Per-source rate limiting
@@ -280,7 +281,7 @@ class Fetcher:
                     content_type = resp.headers.get("content-type", "")
                     if "html" in content_type and "json" not in content_type:
                         raise ValueError(
-                            f"Expected JSON but got HTML from {source} ({url})"
+                            f"Expected JSON but got HTML from {source}"
                         )
                     data = json.loads(await _read_bounded(resp, max_bytes))
                 if not isinstance(data, (dict, list)):
@@ -303,15 +304,15 @@ class Fetcher:
                         "Retry %d/%d for %s (%s), waiting %.1fs",
                         attempt + 1,
                         self.max_retries,
-                        source,
-                        exc,
+                        redact_text(source),
+                        exception_summary(exc),
                         wait,
                     )
                     await asyncio.sleep(wait)
 
         # All retries failed — try stale cache before giving up
         self.breaker.record_failure(source)
-        logger.warning("Fetch failed for %s: %s (url=%s)", source, last_error, url)
+        logger.warning("Fetch failed for %s: %s (host=%s)", redact_text(source), safe_error(last_error), safe_url(url))
         return self._stale_fallback(effective_key, source)
 
     async def get_text(
@@ -364,7 +365,7 @@ class Fetcher:
                     await asyncio.sleep(min(2**attempt, 30))
 
         self.breaker.record_failure(source)
-        logger.warning("Text fetch failed for %s: %s", source, last_error)
+        logger.warning("Text fetch failed for %s: %s (host=%s)", redact_text(source), safe_error(last_error), safe_url(url))
         return self._stale_fallback(effective_key, source)
 
     async def get_xml(
@@ -399,7 +400,7 @@ class Fetcher:
         """
         max_bytes = _validate_max_bytes(max_bytes)
         if not self.breaker.is_available(source):
-            return BinaryResult(None, None, f"circuit open for {source}")
+            return BinaryResult(None, None, f"circuit open for {redact_text(source)}")
 
         await self._source_throttle(source)
         client = await self._get_client()
@@ -420,15 +421,15 @@ class Fetcher:
                 self.breaker.record_success(source)
                 return BinaryResult(resp.status_code, body, None)
             except _ResponseTooLarge as exc:
-                last_error = str(exc)
+                last_error = safe_error(exc)
                 break
             except (httpx.HTTPStatusError, httpx.RequestError) as exc:
-                last_error = f"{type(exc).__name__}: {exc}"
+                last_error = exception_summary(exc)
                 if attempt < self.max_retries:
                     await asyncio.sleep(min(2**attempt, 30))
 
         self.breaker.record_failure(source)
-        logger.warning("Binary fetch failed for %s: %s (url=%s)", source, last_error, url)
+        logger.warning("Binary fetch failed for %s: %s (host=%s)", redact_text(source), last_error, safe_url(url))
         return BinaryResult(last_status, None, last_error)
 
     def _stale_fallback(self, cache_key: str, source: str) -> Any | None:
@@ -448,9 +449,8 @@ class Fetcher:
         value, created_at = meta
         age_seconds = max(0.0, time.time() - created_at)
         logger.info(
-            "Serving stale cache for %s (key=%s, age=%.0fs)",
-            source,
-            cache_key,
+            "Serving stale cache for %s (age=%.0fs)",
+            redact_text(source),
             age_seconds,
         )
         if isinstance(value, dict):

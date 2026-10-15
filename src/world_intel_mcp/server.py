@@ -74,6 +74,8 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
+from .diagnostics import exception_summary, redact_arguments, redact_text, safe_error, sanitize_error_fields
+
 logging.basicConfig(
     level=os.environ.get("WORLD_INTEL_LOG_LEVEL", "INFO"),
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -130,9 +132,13 @@ async def list_tools() -> list[Tool]:
 @server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextContent]:
     args = arguments or {}
-    logger.info("Tool call: %s(%s)", name, json.dumps(args, default=str)[:200])
-    result = await _dispatch(name, args)
-    return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+    logger.info("Tool call: %s(%s)", redact_text(name), json.dumps(redact_arguments(args), default=str)[:200])
+    try:
+        result = await _dispatch(name, args)
+    except Exception as exc:
+        logger.error("Tool %s failed: %s", redact_text(name), exception_summary(exc))
+        result = {"error": safe_error(exc)}
+    return [TextContent(type="text", text=json.dumps(sanitize_error_fields(result), indent=2, default=str))]
 
 
 # ---------------------------------------------------------------------------
