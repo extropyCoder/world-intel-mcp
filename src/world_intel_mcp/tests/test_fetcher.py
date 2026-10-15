@@ -9,6 +9,7 @@ value completely unmodified — the marker was documented but never set.
 import asyncio
 import gzip
 import json
+import zlib
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
@@ -19,6 +20,7 @@ import respx
 from world_intel_mcp.cache import Cache
 from world_intel_mcp.circuit_breaker import CircuitBreaker
 from world_intel_mcp.fetcher import Fetcher
+from world_intel_mcp.fetcher import _read_bounded
 
 
 @pytest.fixture
@@ -519,3 +521,179 @@ async def test_injected_challenge_auth_buffering_is_outside_reader_cap(fetcher):
         assert await _fetch(fetcher, "text", max_bytes=2) == "ok"
     assert len(requests) == 2
     assert challenge.reads == 3 and challenge.closed and final.closed
+
+
+@pytest.mark.parametrize("kind", ["json", "text", "xml", "bytes"])
+@pytest.mark.parametrize("encoding", ["br", "zstd", "unknown", "gzip, deflate", "", "gzip,", "gzip gzip", "\vgzip"])
+async def test_encoding_policy_rejects_unread_terminal(fetcher, streamed, kind, encoding):
+    route, streams, responses = streamed([b"unread"], headers={"Content-Encoding": encoding})
+    result = await _fetch(fetcher, kind)
+    if kind == "bytes":
+        assert not result.ok
+    else:
+        assert result is None
+    assert route.call_count == 1
+    assert streams[0].reads == 0 and streams[0].closed and responses[0].is_closed
+    assert fetcher.breaker.status()["test-source"]["total_failures"] == 1
+
+
+async def test_duplicate_encoding_headers_rejected_unread(fetcher, streamed):
+    _, streams, _ = streamed([b"unread"], headers=[("content-encoding", "gzip"), ("content-encoding", "gzip")])
+    assert await _fetch(fetcher, "text") is None
+    assert streams[0].reads == 0
+
+
+@pytest.mark.parametrize("raw", [False, True])
+async def test_http_deflate_one_byte_stream(fetcher, streamed, raw):
+    compressor = zlib.compressobj(wbits=-15 if raw else 15)
+    body = b"hello" * 20000
+    wire = compressor.compress(body) + compressor.flush()
+    streamed([b""] + [wire[i:i + 1] for i in range(len(wire))] + [b""], headers={"content-encoding": "DeFlAtE"})
+    assert (await _fetch(fetcher, "bytes", max_bytes=len(body))).content == body
+
+
+@pytest.mark.parametrize("length", [None, "1", "invalid", "9999999"])
+@pytest.mark.parametrize("overflow", [False, True])
+async def test_encoded_budget_is_actual_wire_count(fetcher, streamed, length, overflow):
+    wire = gzip.compress(b"a")
+    headers = {"content-encoding": "gzip"}
+    if length is not None:
+        headers["content-length"] = length
+    route, streams, _ = streamed([wire, b"unread"], headers=headers)
+    # Stop after wire: the second chunk is only present on the rejection path.
+    if not overflow:
+        route, streams, _ = streamed([wire], headers=headers)
+    result = await _fetch(fetcher, "bytes", max_bytes=10, max_encoded_bytes=len(wire) - int(overflow))
+    assert result.ok is not overflow
+    if not overflow:
+        assert result.content == b"a"
+    else:
+        assert "encoded" in result.error and streams[0].reads == 1
+    assert route.call_count == 1 and streams[0].closed
+
+
+@pytest.mark.parametrize("compressed", [False, True])
+async def test_raw_huge_chunk_and_no_httpx_decoding(fetcher, streamed, monkeypatch, compressed):
+    def forbidden(*args, **kwargs):
+        pytest.fail("HTTPX must not decode/chunk the response")
+    monkeypatch.setattr(httpx.Response, "aiter_bytes", forbidden)
+    body = bytes(range(256)) * 1024
+    streamed([gzip.compress(body) if compressed else body],
+             headers={"content-encoding": "gzip"} if compressed else {})
+    assert (await _fetch(fetcher, "bytes", max_bytes=len(body))).content == body
+
+
+async def test_application_gzip_is_opaque_to_binary_fetch(fetcher, streamed):
+    body = gzip.compress(b"application payload")
+    streamed([body], headers={"content-type": "application/gzip"})
+    assert (await _fetch(fetcher, "bytes")).content == body
+
+
+async def test_negotiation_overrides_injected_and_caller_headers(fetcher):
+    requests = []
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(302, headers={"location": "/final"}, stream=_Chunks([])) if len(requests) == 1 else httpx.Response(200, stream=_Chunks([b"ok"]))
+    async with httpx.AsyncClient(
+        headers={"Accept-Encoding": "br, zstd"}, follow_redirects=True,
+        transport=httpx.MockTransport(respond),
+    ) as client:
+        fetcher._client = client
+        assert await _fetch(fetcher, "text", headers={"accept-encoding": "identity"}) == "ok"
+    assert [r.headers["accept-encoding"] for r in requests] == ["gzip, deflate"] * 2
+
+
+async def test_processing_deadline_includes_stream_wait_and_closes(fetcher, streamed):
+    route, streams, responses = streamed([b""], pause=asyncio.Event())
+    result = await _fetch(fetcher, "bytes", processing_timeout=0.01)
+    assert not result.ok and "deadline" in result.error
+    assert route.call_count == 1 and streams[0].closed and responses[0].is_closed
+
+
+async def test_cancel_during_in_memory_expansion_is_cooperative(fetcher, streamed, monkeypatch):
+    from world_intel_mcp.bounded_decode import BoundedDecoder
+    entered = asyncio.Event()
+    original = BoundedDecoder.feed
+    def observe(self, data):
+        for output in original(self, data):
+            entered.set()
+            yield output
+    monkeypatch.setattr(BoundedDecoder, "feed", observe)
+    _, streams, _ = streamed([gzip.compress(b"x" * (4 * 1024 * 1024))], headers={"content-encoding": "gzip"})
+    task = asyncio.create_task(_fetch(fetcher, "bytes"))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert streams[0].closed
+
+
+async def test_prebuffered_content_is_not_decoded_twice():
+    response = httpx.Response(200, content=gzip.compress(b"hello"), headers={"content-encoding": "gzip"})
+    assert response.is_stream_consumed and response.content == b"hello"
+    assert await _read_bounded(response, 5) == b"hello"
+    with pytest.raises(ValueError, match="cap"):
+        await _read_bounded(response, 4)
+
+
+async def test_terminal_encoding_failure_preserves_stale_and_no_writes(fetcher, streamed):
+    fetcher.cache.set("stale", {"old": True}, ttl_seconds=-1)
+    fetcher.vector_store = Mock(store=AsyncMock())
+    route, streams, _ = streamed([b"unread"], headers={"content-encoding": "br"})
+    result = await _fetch(fetcher, "json", cache_key="stale")
+    assert result["old"] and result["_stale"]
+    assert fetcher.cache.get("stale") is None
+    fetcher.vector_store.store.assert_not_called()
+    assert route.call_count == 1 and streams[0].reads == 0
+
+
+async def test_constructor_body_options_and_per_call_override(cache, breaker):
+    fetcher = Fetcher(cache, breaker, max_encoded_bytes=1, processing_timeout=2)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda _: httpx.Response(200, stream=_Chunks([b"ok"]))
+    )) as client:
+        fetcher._client = client
+        assert not (await _fetch(fetcher, "bytes")).ok
+        assert (await _fetch(fetcher, "bytes", max_encoded_bytes=2)).content == b"ok"
+
+
+@pytest.mark.parametrize("option,value", [
+    ("max_encoded_bytes", 0), ("max_encoded_bytes", True),
+    ("processing_timeout", 0), ("processing_timeout", float("inf")),
+    ("processing_timeout", float("nan")), ("processing_timeout", True),
+])
+async def test_body_options_validate_before_request_or_cache(fetcher, cache, breaker, option, value):
+    with pytest.raises(ValueError):
+        Fetcher(cache, breaker, **{option: value})
+    for kind in ("json", "text", "xml", "bytes"):
+        with pytest.raises(ValueError):
+            await _fetch(fetcher, kind, **{option: value})
+
+
+async def test_deadline_during_decoding_is_terminal(fetcher, streamed, monkeypatch):
+    from world_intel_mcp.bounded_decode import BoundedDecoder, BodyLimitError
+    original = BoundedDecoder.check_time
+    calls = 0
+    def expires(self):
+        nonlocal calls
+        calls += 1
+        if calls >= 4:
+            raise BodyLimitError("body processing deadline exceeded")
+        original(self)
+    monkeypatch.setattr(BoundedDecoder, "check_time", expires)
+    route, streams, _ = streamed([gzip.compress(b"x" * 1000000)], headers={"content-encoding": "gzip"})
+    result = await _fetch(fetcher, "bytes")
+    assert not result.ok and "deadline" in result.error
+    assert route.call_count == 1 and streams[0].closed
+
+
+@pytest.mark.parametrize("encoding,wire", [
+    ("gzip", gzip.compress(b"x")[:-1]),
+    ("gzip", gzip.compress(b"x") + b"padding"),
+    ("deflate", zlib.compress(b"x")[:-1]),
+])
+async def test_integrity_failure_is_terminal_no_cache(fetcher, streamed, encoding, wire):
+    route, streams, _ = streamed([wire], headers={"content-encoding": encoding})
+    assert await _fetch(fetcher, "text") is None
+    assert route.call_count == 1 and streams[0].closed
+    assert fetcher.breaker.status()["test-source"]["total_failures"] == 1

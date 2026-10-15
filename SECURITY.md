@@ -153,6 +153,33 @@ can configure `Fetcher(max_json_bytes=..., max_text_bytes=...)` and pass
 Content-Length is not trusted. Oversized responses are closed, never retried
 or cached, and count as one circuit-breaker failure. JSON/text/XML use the
 existing stale fallback; binary calls return an error with no partial body.
+There is also an **encoded-byte** budget, defaulting to the selected decoded
+cap plus 1 MiB. Set `max_encoded_bytes=...` on `Fetcher` or an individual GET
+to override it. Constructor and per-GET `processing_timeout=...` select a finite
+positive body-reader deadline (default **120 seconds**, per attempt), in addition
+to HTTPX's network inactivity timeout. These new options are keyword-only.
+
+GETs explicitly negotiate only `gzip, deflate`, including injected clients and
+redirects. Absent Content-Encoding and `identity` are accepted; br/zstd, unknown,
+stacked, empty or malformed encodings are rejected before body reads. This is
+intentional even when optional compression libraries are installed. Encoded
+bodies are read through HTTPX's **raw** iterator and a package-owned stdlib zlib
+decoder, not HTTPX's automatic decompression. Input slices are at most 16 KiB;
+every zlib output request is at most `min(64 KiB, remaining decoded budget + 1)`.
+The sentinel byte detects overflow without retaining a partial result. There
+are no unbounded decompress/flush calls. Wrapped deflate is tried on an initial
+two-byte prefix, with raw-deflate fallback only there, before any output. An
+ambiguous raw stream with a valid zlib prefix is not retried as raw later.
+Gzip permits at most **1,024 concatenated members**, sharing one decoded budget;
+checksums and termination are required, and **all padding/trailing garbage is
+rejected**, including zero padding. Size, encoding, integrity, member-limit and
+processing-deadline errors are terminal, with no retry/cache/vector writes.
+
+The reader yields cooperatively between bounded operations. Its deadline starts
+after final response headers reach the reader, includes body-stream waits, and
+excludes connection/header acquisition, rate limiting, auth/hooks, parsing and
+cache writes. It cannot interrupt a synchronous native call or guarantee an
+instantaneous cancellation/closure under a misbehaving custom transport.
 Redirect and HTTP-error bodies exposed to the fetcher are discarded without
 reading them. Client authentication is applied on the initial send only;
 redirects preserve HTTPX's Authorization stripping and retention decisions.
@@ -165,9 +192,31 @@ example, Digest challenges) before returning control to the bounded reader;
 those internal reads are not capped here. Basic auth and explicit Authorization
 headers do not require challenge-body reads.
 
-These caps bound accepted body bytes, not total process memory: HTTPX may
-produce a larger individual decompressed chunk before the cap check, and
-parsing/decoding requires additional memory. Previously cached data is not
+Pre-buffered HTTPX responses are supported as already-decoded content, never
+decoded twice. The reader checks their decoded size and any observed download
+count, but cannot undo their prior allocations or recover unobserved encoded
+size. Custom transports must supply raw encoded bytes on unconsumed streams;
+their own buffering/decompression is outside this boundary. Standard HTTPcore
+uses bounded network reads, but arbitrary custom streams may allocate a large
+raw chunk before yielding control here.
+
+Heatmap application gzip (`.bin.gz` data, independently of HTTP Content-Encoding)
+uses the same bounded gzip primitive. `HEATMAP_MAX_COMPRESSED_BYTES` and
+`HEATMAP_MAX_EXPANDED_BYTES` default separately to **256 MiB**; raw heatmaps must
+fit both. Override `max_compressed_bytes`, `max_expanded_bytes` and
+`processing_timeout` on `HeatmapDiskCache` (or directly on `parse_heatmap`). Disk
+cache reads stop at the input cap plus a sentinel byte; downloaded and cached
+bodies undergo expanded-size validation before record parsing. The heatmap
+deadline covers application decompression plus parsing (checked every 4,096
+records), not disk I/O or cache compression/writes. Parsing runs in a thread;
+cancelling its await does **not** kill that thread. Byte/record bounds and the
+thread's deadline constrain work, not the memory footprint of its Python objects.
+
+These caps bound accepted body bytes and fetcher-controlled decompression output,
+**not total process memory**. Accumulation/final copies, decompressor state,
+text/JSON objects, heatmap sets/tracks, transport/native allocations and concurrent
+requests require additional memory. There are no general JSON depth/node limits
+or process isolation in this patch. Previously cached JSON/text data is not
 re-sized by these network limits. Operator-configured outbound POST sinks
 are outside these GET limits; this is not a URL/SSRF policy.
 

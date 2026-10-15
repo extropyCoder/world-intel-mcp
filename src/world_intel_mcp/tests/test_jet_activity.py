@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import gzip
 import struct
+from types import SimpleNamespace
 from datetime import date, datetime, timedelta, timezone
 
 import httpx
@@ -117,6 +118,81 @@ def test_parse_heatmap_rejects_truncated_and_markerless_bodies():
         jc.parse_heatmap(blob[:-3], wanted=None)
     with pytest.raises(ValueError, match="no slice markers"):
         jc.parse_heatmap(_E.pack(1, 2, 3, 4, 5) * 4, wanted=None)
+
+
+@pytest.mark.parametrize("compressed", [False, True])
+def test_heatmap_input_and_expanded_limits_preserve_filtering(compressed):
+    raw = encode_heatmap(T0, [[airborne(1), airborne(2, lat=10, lon=10)]], gz=False)
+    body = gzip.compress(raw) if compressed else raw
+    result = jc.parse_heatmap(body, {1, 2}, (24, -126, 50, -66),
+                             max_compressed_bytes=len(body), max_expanded_bytes=len(raw))
+    assert set(result[1]) == {1} and result[2] == 2
+    with pytest.raises(ValueError, match="cap"):
+        jc.parse_heatmap(body, None, max_compressed_bytes=len(body) - 1)
+    with pytest.raises(ValueError, match="cap"):
+        jc.parse_heatmap(body, None, max_expanded_bytes=len(raw) - 1)
+
+
+@pytest.mark.parametrize("cached", [False, True])
+@respx.mock
+async def test_heatmap_bomb_download_and_cache_no_partial_write(fetcher, tmp_path, no_floor, cached):
+    bomb = gzip.compress(b"\0" * 100000)
+    disk = jc.HeatmapDiskCache(tmp_path / "hm", 10**9, max_expanded_bytes=100)
+    if cached:
+        path = disk.path_for(T0)
+        path.parent.mkdir(parents=True)
+        path.write_bytes(bomb)
+    else:
+        respx.get(jc.heatmap_url(T0)).mock(return_value=httpx.Response(200, content=bomb))
+    result = await jc.fetch_slot(fetcher, T0, None, None, disk)
+    assert result.status == "error" and "cap" in result.error
+    assert disk.path_for(T0).exists() is cached
+
+
+def test_heatmap_cache_read_uses_sentinel_not_read_bytes(tmp_path, monkeypatch):
+    disk = jc.HeatmapDiskCache(tmp_path, 10000, max_compressed_bytes=8)
+    path = disk.path_for(T0)
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"12345678")
+    monkeypatch.setattr(type(path), "read_bytes", lambda *_: pytest.fail("unbounded cache read"))
+    assert disk.get(T0) == b"12345678"
+    path.write_bytes(b"123456789")
+    with pytest.raises(ValueError, match="cap"):
+        disk.get(T0)
+
+
+@respx.mock
+async def test_heatmap_double_layer_http_and_application_gzip(fetcher, tmp_path, no_floor):
+    body = encode_heatmap(T0, [[airborne(1), airborne(2, lat=10, lon=10)]])
+    wire = gzip.compress(body)
+    class Stream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            for i in range(len(wire)):
+                yield wire[i:i + 1]
+    respx.get(jc.heatmap_url(T0)).mock(return_value=httpx.Response(
+        200, stream=Stream(), headers={"content-encoding": "gzip"}))
+    disk = jc.HeatmapDiskCache(tmp_path, 10000)
+    result = await jc.fetch_slot(fetcher, T0, {1, 2}, (24, -126, 50, -66), disk)
+    assert result.status == "ok" and set(result.data.tracks) == {1}
+    assert disk.get(T0) == body
+
+
+@respx.mock
+async def test_oversize_cached_heatmap_is_error_without_network(fetcher, tmp_path):
+    disk = jc.HeatmapDiskCache(tmp_path, 10000, max_compressed_bytes=8)
+    path = disk.path_for(T0)
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"x" * 9)
+    result = await jc.fetch_slot(fetcher, T0, None, None, disk)
+    assert result.status == "error" and result.cached
+
+
+def test_heatmap_record_processing_deadline(tmp_path, monkeypatch):
+    clock = iter([0.0, 2.0])
+    monkeypatch.setattr(jc, "time", SimpleNamespace(monotonic=lambda: next(clock)))
+    raw = encode_heatmap(T0, [[airborne(1)]], gz=False)
+    with pytest.raises(ValueError, match="deadline"):
+        jc.parse_heatmap(raw, None, processing_timeout=1)
 
 
 def test_parse_heatmap_thins_but_keeps_state_changes():

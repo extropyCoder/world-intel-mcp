@@ -16,6 +16,10 @@ from typing import Any
 import httpx
 
 from .cache import Cache
+from .bounded_decode import (
+    BoundedDecoder, BodyLimitError, ResponseTooLarge, INPUT_CHUNK,
+    DEFAULT_PROCESSING_TIMEOUT, positive_bytes, processing_timeout as _validate_processing_timeout,
+)
 from .circuit_breaker import CircuitBreaker
 from .diagnostics import exception_summary, redact_text, safe_error, safe_url
 
@@ -26,29 +30,59 @@ _DEFAULT_TEXT_MAX_BYTES = 32 * 1024 * 1024
 _DEFAULT_BINARY_MAX_BYTES = 256 * 1024 * 1024
 
 
-class _ResponseTooLarge(ValueError):
-    """A decoded response exceeded its cap; retrying it would waste bandwidth."""
+_ResponseTooLarge = ResponseTooLarge
 
 
 def _validate_max_bytes(value: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ValueError("max_bytes must be a positive integer")
-    return value
+    return positive_bytes(value)
 
 
-async def _read_bounded(response: httpx.Response, max_bytes: int) -> bytes:
-    """Accumulate only complete, capped decoded bodies, ignoring Content-Length.
+async def _read_bounded(
+    response: httpx.Response, max_bytes: int, *, max_encoded_bytes: int | None = None,
+    processing_timeout: float = DEFAULT_PROCESSING_TIMEOUT,
+) -> bytes:
+    """Read raw HTTP bytes with bounded package-owned decoding.
 
-    HTTPX removes HTTP content encodings (gzip, etc.) in aiter_bytes. Check
-    each yielded chunk before retaining it, not compressed wire-byte counts.
-    The caller owns the response context and closes on every exit path.
+    Deadline starts at body-reader entry, includes stream waits, and excludes
+    connection/header acquisition, hooks/auth, parsing and cache operations.
+    Pre-buffered HTTPX content is already decoded; prior allocations/wire bytes
+    cannot be recovered or bounded here. Content-Length is never trusted.
     """
-    body = bytearray()
-    async for chunk in response.aiter_bytes():
-        if len(body) + len(chunk) > max_bytes:
-            raise _ResponseTooLarge(f"decoded body exceeds cap {max_bytes} bytes")
-        body.extend(chunk)
-    return bytes(body)
+    encoded_limit = positive_bytes(max_bytes + 1024 * 1024 if max_encoded_bytes is None else max_encoded_bytes)
+    timeout = _validate_processing_timeout(processing_timeout)
+    values = response.headers.get_list("content-encoding")
+    encoding = "identity" if not values else ",".join(values).strip(" \t").lower()
+    if encoding not in ("identity", "gzip", "deflate"):
+        raise BodyLimitError("unsupported or malformed content encoding")
+    try:
+        async with asyncio.timeout(timeout):
+            decoder = BoundedDecoder(encoding, max_bytes, deadline=time.monotonic() + timeout)
+            if response.is_stream_consumed:
+                # .content is public and already decoded by HTTPX. Never decode
+                # it a second time or pretend we observed its original wire size.
+                content = response.content
+                if len(content) > max_bytes or response.num_bytes_downloaded > encoded_limit:
+                    raise _ResponseTooLarge("pre-buffered body exceeds cap")
+                if encoding == "identity" and len(content) > encoded_limit:
+                    raise _ResponseTooLarge("encoded body exceeds cap")
+                await asyncio.sleep(0)
+                return content
+            body = bytearray()
+            encoded = 0
+            async for chunk in response.aiter_raw():
+                encoded += len(chunk)
+                if encoded > encoded_limit:
+                    raise _ResponseTooLarge("encoded body exceeds cap")
+                for offset in range(0, len(chunk), INPUT_CHUNK):
+                    for output in decoder.feed(chunk[offset:offset + INPUT_CHUNK]):
+                        body.extend(output)
+                        await asyncio.sleep(0)
+                decoder.check_time()
+                await asyncio.sleep(0)
+            decoder.finish()
+            return bytes(body)
+    except TimeoutError as exc:
+        raise BodyLimitError("body processing deadline exceeded") from exc
 
 
 def _response_text(response: httpx.Response, body: bytes) -> str:
@@ -135,6 +169,8 @@ class Fetcher:
         *,
         max_json_bytes: int = _DEFAULT_JSON_MAX_BYTES,
         max_text_bytes: int = _DEFAULT_TEXT_MAX_BYTES,
+        max_encoded_bytes: int | None = None,
+        processing_timeout: float = DEFAULT_PROCESSING_TIMEOUT,
     ):
         self.cache = cache
         self.breaker = breaker
@@ -144,6 +180,15 @@ class Fetcher:
         self.vector_store = vector_store  # VectorStore instance (optional)
         self.max_json_bytes = _validate_max_bytes(max_json_bytes)
         self.max_text_bytes = _validate_max_bytes(max_text_bytes)
+        self.max_encoded_bytes = None if max_encoded_bytes is None else positive_bytes(max_encoded_bytes)
+        self.processing_timeout = _validate_processing_timeout(processing_timeout)
+
+    async def _read_body(self, response, max_bytes, max_encoded_bytes, processing_timeout):
+        return await _read_bounded(
+            response, max_bytes,
+            max_encoded_bytes=self.max_encoded_bytes if max_encoded_bytes is None else max_encoded_bytes,
+            processing_timeout=self.processing_timeout if processing_timeout is None else processing_timeout,
+        )
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -174,6 +219,7 @@ class Fetcher:
         HTTPX may buffer challenge responses internally before returning here.
         """
         request = client.build_request("GET", url, **kwargs)
+        request.headers["Accept-Encoding"] = "gzip, deflate"
         redirects = 0
         while True:
             # Reapplying client auth would restore Authorization after HTTPX
@@ -190,6 +236,7 @@ class Fetcher:
                             "Exceeded maximum allowed redirects.", request=request
                         )
                     request = response.next_request
+                    request.headers["Accept-Encoding"] = "gzip, deflate"
                     redirects += 1
                     continue
                 yield response
@@ -230,6 +277,8 @@ class Fetcher:
         yahoo_rate_limit: bool = False,
         *,
         max_bytes: int | None = None,
+        max_encoded_bytes: int | None = None,
+        processing_timeout: float | None = None,
     ) -> dict | list | None:
         """Fetch JSON with caching, circuit breaking, and retries.
 
@@ -243,11 +292,16 @@ class Fetcher:
             timeout: Per-request timeout override.
             yahoo_rate_limit: If True, enforce Yahoo Finance 600ms serialization.
             max_bytes: Decoded response cap; defaults to max_json_bytes (32 MiB).
+            max_encoded_bytes: Wire-body cap; defaults to decoded cap + 1 MiB
+                unless configured on the Fetcher.
+            processing_timeout: Body-reader deadline, not a parsing timeout;
+                defaults to the Fetcher's 120-second setting.
 
         Returns:
             Parsed JSON or None on failure.
         """
         max_bytes = _validate_max_bytes(self.max_json_bytes if max_bytes is None else max_bytes)
+        self._validate_body_options(max_encoded_bytes, processing_timeout)
         # Check cache (live)
         effective_key = cache_key or f"{source}:{url}:{params}"
         cached = self.cache.get(effective_key)
@@ -283,7 +337,7 @@ class Fetcher:
                         raise ValueError(
                             f"Expected JSON but got HTML from {source}"
                         )
-                    data = json.loads(await _read_bounded(resp, max_bytes))
+                    data = json.loads(await self._read_body(resp, max_bytes, max_encoded_bytes, processing_timeout))
                 if not isinstance(data, (dict, list)):
                     raise ValueError(
                         f"Expected dict/list from {source}, got {type(data).__name__}"
@@ -293,7 +347,7 @@ class Fetcher:
                 if self.vector_store:
                     await self.vector_store.store(source, data)
                 return data
-            except _ResponseTooLarge as exc:
+            except BodyLimitError as exc:
                 last_error = exc
                 break
             except (httpx.HTTPStatusError, httpx.RequestError, Exception) as exc:
@@ -326,9 +380,12 @@ class Fetcher:
         timeout: float | None = None,
         *,
         max_bytes: int | None = None,
+        max_encoded_bytes: int | None = None,
+        processing_timeout: float | None = None,
     ) -> str | None:
         """Fetch text with caching and a decoded-byte cap (default 32 MiB)."""
         max_bytes = _validate_max_bytes(self.max_text_bytes if max_bytes is None else max_bytes)
+        self._validate_body_options(max_encoded_bytes, processing_timeout)
         effective_key = cache_key or f"{source}:text:{url}:{params}"
         cached = self.cache.get(effective_key)
         if cached is not None:
@@ -352,11 +409,11 @@ class Fetcher:
                     timeout=timeout or self.default_timeout,
                 ) as resp:
                     resp.raise_for_status()
-                    text = _response_text(resp, await _read_bounded(resp, max_bytes))
+                    text = _response_text(resp, await self._read_body(resp, max_bytes, max_encoded_bytes, processing_timeout))
                 self.breaker.record_success(source)
                 self.cache.set(effective_key, text, cache_ttl)
                 return text
-            except _ResponseTooLarge as exc:
+            except BodyLimitError as exc:
                 last_error = exc
                 break
             except (httpx.HTTPStatusError, httpx.RequestError, Exception) as exc:
@@ -377,10 +434,13 @@ class Fetcher:
         timeout: float | None = None,
         *,
         max_bytes: int | None = None,
+        max_encoded_bytes: int | None = None,
+        processing_timeout: float | None = None,
     ) -> str | None:
         """Fetch XML content (returns raw text for feedparser/ET parsing)."""
         return await self.get_text(
-            url, source, cache_key, cache_ttl, timeout=timeout, max_bytes=max_bytes
+            url, source, cache_key, cache_ttl, timeout=timeout, max_bytes=max_bytes,
+            max_encoded_bytes=max_encoded_bytes, processing_timeout=processing_timeout,
         )
 
     async def get_bytes(
@@ -390,6 +450,9 @@ class Fetcher:
         headers: dict[str, str] | None = None,
         timeout: float | None = None,
         max_bytes: int = _DEFAULT_BINARY_MAX_BYTES,
+        *,
+        max_encoded_bytes: int | None = None,
+        processing_timeout: float | None = None,
     ) -> BinaryResult:
         """Fetch a binary body with rate limiting, retries and circuit breaking.
 
@@ -399,6 +462,7 @@ class Fetcher:
         larger than ``max_bytes`` decoded bytes is a failure, never retried.
         """
         max_bytes = _validate_max_bytes(max_bytes)
+        self._validate_body_options(max_encoded_bytes, processing_timeout)
         if not self.breaker.is_available(source):
             return BinaryResult(None, None, f"circuit open for {redact_text(source)}")
 
@@ -417,10 +481,10 @@ class Fetcher:
                         self.breaker.record_success(source)
                         return BinaryResult(404, None, None)
                     resp.raise_for_status()
-                    body = await _read_bounded(resp, max_bytes)
+                    body = await self._read_body(resp, max_bytes, max_encoded_bytes, processing_timeout)
                 self.breaker.record_success(source)
                 return BinaryResult(resp.status_code, body, None)
-            except _ResponseTooLarge as exc:
+            except BodyLimitError as exc:
                 last_error = safe_error(exc)
                 break
             except (httpx.HTTPStatusError, httpx.RequestError) as exc:
@@ -431,6 +495,13 @@ class Fetcher:
         self.breaker.record_failure(source)
         logger.warning("Binary fetch failed for %s: %s (host=%s)", redact_text(source), last_error, safe_url(url))
         return BinaryResult(last_status, None, last_error)
+
+    @staticmethod
+    def _validate_body_options(max_encoded_bytes, processing_timeout):
+        if max_encoded_bytes is not None:
+            positive_bytes(max_encoded_bytes)
+        if processing_timeout is not None:
+            _validate_processing_timeout(processing_timeout)
 
     def _stale_fallback(self, cache_key: str, source: str) -> Any | None:
         """Return stale (expired) cached data as last-known-good fallback.

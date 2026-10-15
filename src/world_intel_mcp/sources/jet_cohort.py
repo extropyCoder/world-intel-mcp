@@ -53,6 +53,10 @@ from pathlib import Path
 from typing import Any
 
 from ..fetcher import Fetcher
+from ..bounded_decode import (
+    BodyLimitError, ResponseTooLarge, decode_gzip, positive_bytes,
+    DEFAULT_PROCESSING_TIMEOUT, processing_timeout as validate_processing_timeout,
+)
 
 logger = logging.getLogger("world-intel-mcp.sources.jet_cohort")
 
@@ -64,6 +68,8 @@ ADSBLOL_API = "https://api.adsb.lol/v2"
 HEATMAP_URL = "https://adsb.lol/globe_history/{y:04d}/{m:02d}/{d:02d}/heatmap/{slot:02d}.bin.ttf"
 HEATMAP_SOURCE = "adsblol-history"
 USER_AGENT = "world-intel-mcp (+https://github.com/marc-shade/world-intel-mcp)"
+HEATMAP_MAX_COMPRESSED_BYTES = 256 * 1024 * 1024
+HEATMAP_MAX_EXPANDED_BYTES = 256 * 1024 * 1024
 
 # ICAO Doc 8643 type designators for business jets. Unknown designators
 # simply match nothing on the type endpoint, so the list errs inclusive.
@@ -425,6 +431,10 @@ def parse_heatmap(
     blob: bytes,
     wanted: set[int] | None,
     bbox: tuple[float, float, float, float] | None = None,
+    *,
+    max_compressed_bytes: int = HEATMAP_MAX_COMPRESSED_BYTES,
+    max_expanded_bytes: int = HEATMAP_MAX_EXPANDED_BYTES,
+    processing_timeout: float = DEFAULT_PROCESSING_TIMEOUT,
 ) -> tuple[list[float], dict[int, list[tuple]], int]:
     """Decode a readsb heatmap body (gzip or raw).
 
@@ -435,8 +445,18 @@ def parse_heatmap(
 
     Raises ValueError for a truncated body or one with no slice markers.
     """
+    positive_bytes(max_compressed_bytes)
+    positive_bytes(max_expanded_bytes)
+    deadline = time.monotonic() + validate_processing_timeout(processing_timeout)
+    if len(blob) > max_compressed_bytes:
+        raise ResponseTooLarge("heatmap input exceeds compressed/input cap")
     if blob[:2] == b"\x1f\x8b":
-        blob = gzip.decompress(blob)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise BodyLimitError("heatmap processing deadline exceeded")
+        blob = decode_gzip(blob, max_expanded_bytes, timeout=remaining)
+    if len(blob) > max_expanded_bytes:
+        raise ResponseTooLarge("heatmap exceeds expanded cap")
     if len(blob) % _ENTRY.size:
         raise ValueError(f"heatmap body length {len(blob)} is not a multiple of 16")
 
@@ -447,7 +467,9 @@ def parse_heatmap(
     if bbox is not None:
         lat_lo, lon_lo, lat_hi, lon_hi = (int(v * 1_000_000) for v in bbox)
 
-    for addr_raw, lat_i, lon_i, alt, gs in _ENTRY.iter_unpack(blob):
+    for index, (addr_raw, lat_i, lon_i, alt, gs) in enumerate(_ENTRY.iter_unpack(blob)):
+        if index % 4096 == 0 and time.monotonic() >= deadline:
+            raise BodyLimitError("heatmap processing deadline exceeded")
         if addr_raw == SLICE_MARKER:
             epoch_ms = ((lat_i & 0xFFFFFFFF) << 32) | (lon_i & 0xFFFFFFFF)
             current_ts = epoch_ms / 1000.0
@@ -479,6 +501,8 @@ def parse_heatmap(
         ):
             track.append(fix)
 
+    if time.monotonic() >= deadline:
+        raise BodyLimitError("heatmap processing deadline exceeded")
     if not slices:
         raise ValueError("heatmap body contains no slice markers")
     return slices, tracks, len(seen_all)
@@ -487,9 +511,17 @@ def parse_heatmap(
 class HeatmapDiskCache:
     """On-disk LRU of raw heatmap bodies (immutable once published)."""
 
-    def __init__(self, root: Path, cap_bytes: int):
+    def __init__(
+        self, root: Path, cap_bytes: int, *,
+        max_compressed_bytes: int = HEATMAP_MAX_COMPRESSED_BYTES,
+        max_expanded_bytes: int = HEATMAP_MAX_EXPANDED_BYTES,
+        processing_timeout: float = DEFAULT_PROCESSING_TIMEOUT,
+    ):
         self.root = Path(root)
         self.cap_bytes = cap_bytes
+        self.max_compressed_bytes = positive_bytes(max_compressed_bytes)
+        self.max_expanded_bytes = positive_bytes(max_expanded_bytes)
+        self.processing_timeout = validate_processing_timeout(processing_timeout)
 
     def path_for(self, start: datetime) -> Path:
         return self.root / f"{start:%Y}" / f"{start:%m}" / f"{start:%d}" / f"{slot_index(start):02d}.bin.gz"
@@ -499,13 +531,23 @@ class HeatmapDiskCache:
         if not p.exists():
             return None
         os.utime(p)  # LRU recency
-        return p.read_bytes()
+        body = bytearray()
+        with p.open("rb") as stream:
+            while chunk := stream.read(min(64 * 1024, self.max_compressed_bytes - len(body) + 1)):
+                if len(body) + len(chunk) > self.max_compressed_bytes:
+                    raise ResponseTooLarge("cached heatmap exceeds input cap")
+                body.extend(chunk)
+        return bytes(body)
 
     def put(self, start: datetime, body: bytes) -> None:
         p = self.path_for(start)
         p.parent.mkdir(parents=True, exist_ok=True)
         if body[:2] != b"\x1f\x8b":
+            if len(body) > self.max_expanded_bytes:
+                raise ResponseTooLarge("heatmap exceeds expanded cap")
             body = gzip.compress(body, compresslevel=6)
+        if len(body) > self.max_compressed_bytes:
+            raise ResponseTooLarge("heatmap exceeds compressed cap")
         tmp = p.with_suffix(".tmp")
         tmp.write_bytes(body)
         tmp.replace(p)
@@ -543,7 +585,10 @@ async def fetch_slot(
     disk: HeatmapDiskCache,
 ) -> SlotFetch:
     """Fetch (disk cache first) and parse one half-hour heatmap slot."""
-    body = disk.get(start)
+    try:
+        body = disk.get(start)
+    except (ValueError, OSError) as exc:
+        return SlotFetch(start, None, "error", f"unreadable heatmap: {exc}", True)
     cached = body is not None
     if body is None:
         res = await fetcher.get_bytes(
@@ -551,6 +596,7 @@ async def fetch_slot(
             source=HEATMAP_SOURCE,
             headers={"User-Agent": USER_AGENT},
             timeout=120.0,
+            max_bytes=disk.max_compressed_bytes,
         )
         if res.status == 404:
             return SlotFetch(start, None, "not_published")
@@ -558,11 +604,19 @@ async def fetch_slot(
             return SlotFetch(start, None, "error", res.error or f"HTTP {res.status}")
         body = res.content
     try:
-        slices, tracks, total = await asyncio.to_thread(parse_heatmap, body, wanted, bbox)
+        slices, tracks, total = await asyncio.to_thread(
+            parse_heatmap, body, wanted, bbox,
+            max_compressed_bytes=disk.max_compressed_bytes,
+            max_expanded_bytes=disk.max_expanded_bytes,
+            processing_timeout=disk.processing_timeout,
+        )
     except (ValueError, OSError, EOFError) as exc:
         return SlotFetch(start, None, "error", f"unparseable heatmap: {exc}", cached)
     if not cached:
-        await asyncio.to_thread(disk.put, start, body)
+        try:
+            await asyncio.to_thread(disk.put, start, body)
+        except (ValueError, OSError) as exc:
+            return SlotFetch(start, None, "error", f"uncacheable heatmap: {exc}")
     return SlotFetch(start, SlotData(start, slices, tracks, total), "ok", None, cached)
 
 
