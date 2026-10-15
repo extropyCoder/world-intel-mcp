@@ -22,7 +22,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dashboard = ["starlette>=1.3.1", "uvicorn>=0.29.0"]
-vector = ["qdrant-client>=1.9.0", "fastembed>=0.8.0"]
+vector = ["qdrant-client>=1.10.0", "fastembed>=0.8.0"]
 pdf = ["weasyprint>=70.0"]
 dev = [
     "pytest>=9.0.3",

@@ -25,7 +25,9 @@ project lockfile or installation requirements file.
 
 Upper bounds already present on MCP/Pydantic are unchanged. A dash means not
 installed in the main test environment. Fresh latest direct versions were the
-same for Python 3.11 and 3.12.
+same for Python 3.11 and 3.12. This table records the original audit changes;
+the subsequent [Qdrant search compatibility follow-up](#qdrant-search-compatibility-follow-up)
+raises the current client floor from 1.9.0 to 1.10.0.
 
 | Package / group | Previous declared lower bound | Installed | Fresh latest | Revised lower bound |
 |---|---:|---:|---:|---:|
@@ -258,15 +260,17 @@ or changing package managers needs a separate maintainer decision.
 
 ## Limits and follow-up
 
-- **Pre-existing vector compatibility issue:** the latest resolved
+- **Original vector search compatibility issue (resolved by the follow-up below):** the latest resolved
   qdrant-client 1.19.1 wheel's public client has no `search()` method
   (`query_points()` exists), confirmed by source and offline runtime class
-  inspection, while `vector_store.py` calls `client.search()`.
+  inspection, while `vector_store.py` called `client.search()` at audit time.
   The prior range already permitted this release. The tested 1.9.0 minimum
   retains that API. A reviewed compatible deployment constraint or separate
   vector API migration is required; a vulnerability-clean latest resolution
   must not be treated as a fully tested vector deployment. No new upper cap or
-  runtime API migration is imposed by this audit.
+  runtime API migration was imposed by the original audit. The separately scoped
+  follow-up now migrates all three searches and tests actual in-memory queries;
+  it does not establish compatibility of every other vector operation.
 - Scan the **deployed** environment after upgrading, not just these temporary
   inventories. Already-installed vulnerable transitives may remain satisfiable.
 - This audit does not prove that **every** graph admitted by the ranges is safe;
@@ -296,3 +300,106 @@ or changing package managers needs a separate maintainer decision.
 - Offline asset tests enforce the exact reviewed assets, SHA-384 format,
   anonymous CORS and the single documented Google Fonts stylesheet exception.
   No visual browser/pixel comparison or live CDN rendering test was performed.
+
+## Qdrant search compatibility follow-up
+
+The current `pyproject.toml` vector extra requires **qdrant-client >=1.10.0**
+(previous audit floor: 1.9.0). Inspection of installed 1.9.0 confirmed it has no
+`query_points`; installed **1.10.0** has the API and passed real in-memory
+queries. The [tagged 1.10.0 client source](https://github.com/qdrant/qdrant-client/blob/v1.10.0/qdrant_client/qdrant_client.py)
+also contains it. This chooses the earliest Query API release tested here,
+not an arbitrary latest-only pin or a claim that all releases in the range
+have been tested. No upper cap, lockfile or package-manager migration is added.
+
+PyPI version metadata for 1.10.0 and 1.19.1 returned no known vulnerability
+matches. GitHub's reviewed `qdrant-client` advisory list returned
+[GHSA-7m75-x27w-r52r / CVE-2024-3829](https://github.com/advisories/GHSA-7m75-x27w-r52r),
+with affected range `<1.9.0`, first patched `1.9.0`. Thus the new floor retains
+the prior advisory exclusion and permits urllib3 2.x. This was a targeted
+metadata/advisory recheck, **not** a fresh exhaustive vulnerability audit of all
+transitive dependencies or a proof that 1.10.0 is universally safe. The advisory
+mapping's server/client caveat above still applies.
+
+The source audit found exactly three legacy Qdrant `client.search` uses:
+`_search_sync`, `_similar_sync`, and `_correlate_sync`. All now call
+`client.query_points(query=vector, query_filter=..., limit=..., with_payload=True)`
+and normalize the returned envelope through **`.points`**. There is no legacy
+search fallback. Unchanged behavior includes:
+
+- `has_error=False`, domain/category filters and inclusive timestamp cutoffs;
+- caller limits and the correlation candidate limit of 100;
+- cosine-score order, four-decimal score formatting and no new score threshold;
+- cross-domain similar-event lookup (reference domain is metadata, not a filter);
+- category grouping/top-N/category order in correlations;
+- public dictionaries, reference truncation, empty results and sanitized failures.
+
+No analytical ranking/filtering redesign, point-ID query conversion, collection
+schema or embedding-model change is needed: all three existing searches use
+explicit dense vectors. Unit client mocks now expose `query_points` instead of
+`search`, return a
+concrete `.points` envelope, and cannot silently accept calls to removed search.
+The real tests import the HTTP `QueryResponse` model explicitly: the generic
+`qdrant_client.models.QueryResponse` name is also used by an embedding-query
+interface and is not the envelope returned by `query_points` in these clients.
+
+### Follow-up validation
+
+Linux CPython 3.12.15; public PyPI wheels only, no package setup scripts:
+
+- `/tmp/opencode/qdrant-query-minimum` contains client **1.10.0** and the existing
+  test dependency inventory. It intentionally does not install FastEmbed.
+- `/tmp/opencode/qdrant-latest-api` supplies the previously verified **1.19.1**
+  client wheel via `PYTHONPATH`, using that same test environment/dependencies.
+  The actual imported version and class signatures were inspected in both runs.
+- `test_qdrant_queries.py`: **12 real in-memory tests** per version, no Qdrant
+  server. DNS/socket connections and model construction are forbidden. Explicit
+  deterministic 384-dimensional vectors bypass embedding downloads/inference;
+  collection creation, upserts, filters, queries and HTTP response models are real.
+- Vector/query/stats focused selection: **90 passed** for each client version;
+  unavailable-dependency errors are also covered by unit tests.
+- Full offline suite after the stats fix: **1,620 passed, 18 live smoke tests deselected** for each
+  client version, with one existing Starlette/httpx deprecation warning.
+- Wheel build succeeded; packaged metadata requires `qdrant-client>=1.10.0`,
+  and the packaged vector-store module matches source byte-for-byte.
+- Tests cover exact cutoff inclusion, excluded older/error/missing-payload
+  points, domain/category filters, score/rank/limit preservation (including
+  negative cosine scores), optional payload defaults, response envelopes,
+  category grouping, empty collections, missing collections and malformed
+  envelopes/client failures. The minimum client's old search method is forbidden
+  during integration tests; the current client does not have that method.
+- Stats tests query real populated and empty collections on both clients and
+  preserve every other stats field. Explicit unit cases verify existing zero,
+  `None`, and absent `vectors_count` without substituting `points_count`.
+
+Representative commands (the earlier search-only focused selection additionally
+included the analysis, daily-digest, situation and registry test modules):
+
+```bash
+HF_HUB_OFFLINE=1 PYTHONPATH=src /tmp/opencode/qdrant-query-minimum/bin/python \
+  -m pytest src/world_intel_mcp/tests/test_vector_store.py \
+  src/world_intel_mcp/tests/test_qdrant_queries.py -q
+HF_HUB_OFFLINE=1 PYTHONPATH=/tmp/opencode/qdrant-latest-api:src \
+  /tmp/opencode/qdrant-query-minimum/bin/python -m pytest -q
+```
+
+Full runs also set `LD_LIBRARY_PATH` and `FONTCONFIG_FILE` to the previously
+prepared `/tmp/opencode/report-native-libs` native PDF libraries/fonts.
+
+### Deployment qualifications
+
+- Qdrant's [Query API documentation](https://qdrant.tech/documentation/concepts/hybrid-queries/)
+  identifies availability from **server 1.10.0**. Deploy a maintained server
+  compatible with the chosen client, not necessarily that historical release.
+  Old servers without this endpoint will return the existing structured error
+  results; there is intentionally no deprecated-search fallback. No remote
+  Qdrant, production OSINT service or embedding-model download was contacted.
+- No re-embedding or data rewrite is introduced, but backup/validate server
+  upgrades under that service's own upgrade policy. Review deployed transitive
+  packages separately; upgrading this client's declared floor is not a complete
+  deployment-security update.
+- **Collection-stats compatibility fixed:** client 1.19.1's `CollectionInfo` no
+  longer contains `vectors_count`. Stats now retain that output field as
+  `None` (JSON `null`) when unavailable, rather than failing the entire request.
+  Existing values, including zero, are preserved; `points_count` is never used
+  as a replacement. Real in-memory stats tests pass on 1.10.0 and 1.19.1, but
+  this is not full vector-feature or remote-service integration validation.

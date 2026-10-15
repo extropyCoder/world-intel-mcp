@@ -613,6 +613,17 @@ them.
 
 The optional Qdrant vector store accumulates intelligence over time for semantic retrieval. All data fetched through the Fetcher is automatically embedded and stored.
 
+Search uses Qdrant's Query API (`query_points`), requiring Python
+`qdrant-client>=1.10.0` and a Query API-capable server (introduced in Qdrant
+1.10). Use a maintained server release compatible with your client; upgrading
+the Python package does not upgrade or secure a separately deployed server.
+Search and collection stats are tested offline with real in-memory clients
+1.10.0 and 1.19.1; this is not a remote-service or embedding-model integration
+guarantee. See the
+[dependency audit follow-up](docs/dependency-audit-2026-10-15.md#qdrant-search-compatibility-follow-up)
+for coverage. Stats retain `vectors_count` as `null` when the client does not
+report it; `points_count` is not substituted for an unknown vector count.
+
 ### Setup
 
 ```bash

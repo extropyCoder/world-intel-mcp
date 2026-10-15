@@ -91,9 +91,9 @@ def mock_embed():
 @pytest.fixture
 def mock_qdrant():
     """Patch _get_qdrant to return a mock Qdrant client."""
-    client = MagicMock()
-    # Default: search returns empty
-    client.search.return_value = []
+    client = MagicMock(spec_set=["query_points", "scroll", "get_collection", "upsert"])
+    # The query API returns an envelope, not a directly iterable point list.
+    client.query_points.return_value = SimpleNamespace(points=[])
     # Default: scroll returns ([], None) meaning no results, no next offset
     client.scroll.return_value = ([], None)
     # Default: get_collection returns a stats-like object
@@ -427,7 +427,7 @@ class TestSemanticSearch:
     """Test semantic_search with mocked Qdrant."""
 
     async def test_basic_search(self, store, mock_qdrant, mock_embed):
-        mock_qdrant.search.return_value = [
+        mock_qdrant.query_points.return_value.points = [
             _make_scored_point(1, 0.95, domain="markets", text="S&P 500 rallied"),
             _make_scored_point(
                 2, 0.80, domain="crypto", category="Cryptocurrency", text="BTC up 5%"
@@ -441,25 +441,27 @@ class TestSemanticSearch:
         assert result["results"][0]["score"] == 0.95
         assert result["results"][0]["domain"] == "markets"
         assert result["results"][1]["domain"] == "crypto"
-        mock_qdrant.search.assert_called_once()
+        mock_qdrant.query_points.assert_called_once()
+        assert mock_qdrant.query_points.call_args.kwargs["query"] == FAKE_VECTOR
+        assert "query_vector" not in mock_qdrant.query_points.call_args.kwargs
 
     async def test_search_with_domain_filter(self, store, mock_qdrant, mock_embed):
-        mock_qdrant.search.return_value = []
+        mock_qdrant.query_points.return_value.points = []
         await store.semantic_search("test", domain="cyber")
 
-        call_kwargs = mock_qdrant.search.call_args.kwargs
+        call_kwargs = mock_qdrant.query_points.call_args.kwargs
         query_filter = call_kwargs["query_filter"]
         # Should have domain condition + has_error condition
         assert query_filter is not None
 
     async def test_search_with_hours_filter(self, store, mock_qdrant, mock_embed):
-        mock_qdrant.search.return_value = []
+        mock_qdrant.query_points.return_value.points = []
         result = await store.semantic_search("test", hours=12.0)
 
         assert result["filters"]["hours"] == 12.0
 
     async def test_search_returns_country(self, store, mock_qdrant, mock_embed):
-        mock_qdrant.search.return_value = [
+        mock_qdrant.query_points.return_value.points = [
             _make_scored_point(1, 0.9, country="Ukraine"),
         ]
         result = await store.semantic_search("conflict events")
@@ -475,7 +477,7 @@ class TestFindSimilar:
     """Test find_similar with mocked Qdrant."""
 
     async def test_basic_similar(self, store, mock_qdrant, mock_embed):
-        mock_qdrant.search.return_value = [
+        mock_qdrant.query_points.return_value.points = [
             _make_scored_point(
                 10, 0.88, domain="seismology", text="M6.1 quake near Tokyo"
             ),
@@ -489,17 +491,56 @@ class TestFindSimilar:
         assert result["similar"][0]["score"] == 0.88
 
     async def test_similar_with_hours(self, store, mock_qdrant, mock_embed):
-        mock_qdrant.search.return_value = []
+        mock_qdrant.query_points.return_value.points = []
         result = await store.find_similar("markets", "crash", hours=48.0)
         assert result["count"] == 0
 
     async def test_similar_truncates_reference_text(
         self, store, mock_qdrant, mock_embed
     ):
-        mock_qdrant.search.return_value = []
+        mock_qdrant.query_points.return_value.points = []
         long_text = "x" * 500
         result = await store.find_similar("markets", long_text)
         assert len(result["reference_text"]) == 200
+
+
+@pytest.mark.parametrize("method,args,result_key", [
+    ("semantic_search", ("query",), "results"),
+    ("find_similar", ("domain", "text"), "similar"),
+    ("cross_domain_correlate", ("query",), "correlations"),
+])
+@pytest.mark.parametrize("failure", ["exception", "missing_points", "none_points"])
+async def test_query_failure_preserves_public_error_shape(
+    store, mock_qdrant, mock_embed, method, args, result_key, failure
+):
+    if failure == "exception":
+        mock_qdrant.query_points.side_effect = ConnectionError("refused")
+    elif failure == "missing_points":
+        mock_qdrant.query_points.return_value = SimpleNamespace()
+    else:
+        mock_qdrant.query_points.return_value = SimpleNamespace(points=None)
+    result = await getattr(store, method)(*args)
+    assert "error" in result and result[result_key] == []
+    assert result.get("count", result.get("total_signals")) == 0
+    mock_qdrant.query_points.assert_called_once()
+
+
+@pytest.mark.parametrize("method,args,result_key", [
+    ("semantic_search", ("query",), "results"),
+    ("find_similar", ("domain", "text"), "similar"),
+    ("cross_domain_correlate", ("query",), "correlations"),
+])
+async def test_missing_optional_dependencies_degrade_without_loading_models(
+    store, monkeypatch, method, args, result_key
+):
+    monkeypatch.setattr(vs, "find_spec", lambda _: None)
+    assert not vs.vector_dependencies_available()
+    model = MagicMock(side_effect=AssertionError("must not load embedding models"))
+    monkeypatch.setattr(vs, "_get_embed_model", model)
+    result = await getattr(store, method)(*args)
+    assert "dependencies not installed" in result["error"]
+    assert result[result_key] == []
+    model.assert_not_called()
 
 
 # ===================================================================
@@ -560,6 +601,25 @@ class TestCollectionStats:
         assert result["status"] == "green"
         assert result["embedding_dim"] == EMBEDDING_DIM
 
+    @pytest.mark.parametrize("count", [0, None, "absent"])
+    async def test_stats_preserve_zero_or_unknown_vector_count(self, store, mock_qdrant, count):
+        info = mock_qdrant.get_collection.return_value
+        if count == "absent":
+            del info.vectors_count
+        else:
+            info.vectors_count = count
+        result = await store.collection_stats()
+        assert result == {
+            "enabled": True,
+            "collection": COLLECTION_NAME,
+            "points_count": 42,
+            "vectors_count": 0 if count == 0 else None,
+            "indexed_vectors_count": 40,
+            "status": "green",
+            "embedding_model": vs.EMBEDDING_MODEL,
+            "embedding_dim": EMBEDDING_DIM,
+        }
+
     async def test_stats_handles_exception(self):
         s = VectorStore(enabled=True)
         with patch.object(vs, "_get_qdrant", side_effect=ConnectionError("refused")):
@@ -577,7 +637,7 @@ class TestCrossDomainCorrelate:
     """Test cross_domain_correlate groups by category and sorts by score."""
 
     async def test_groups_by_category(self, store, mock_qdrant, mock_embed):
-        mock_qdrant.search.return_value = [
+        mock_qdrant.query_points.return_value.points = [
             _make_scored_point(
                 1,
                 0.95,
@@ -620,7 +680,7 @@ class TestCrossDomainCorrelate:
 
     async def test_respects_limit_per_domain(self, store, mock_qdrant, mock_embed):
         # All same category, but limit_per_domain=2
-        mock_qdrant.search.return_value = [
+        mock_qdrant.query_points.return_value.points = [
             _make_scored_point(i, 0.9 - i * 0.01, category="Financial Markets")
             for i in range(10)
         ]
@@ -632,7 +692,7 @@ class TestCrossDomainCorrelate:
         assert fm[0]["signal_count"] == 2
 
     async def test_empty_results(self, store, mock_qdrant, mock_embed):
-        mock_qdrant.search.return_value = []
+        mock_qdrant.query_points.return_value.points = []
         result = await store.cross_domain_correlate("nothing matches")
 
         assert result["domains_found"] == 0
@@ -640,10 +700,10 @@ class TestCrossDomainCorrelate:
         assert result["total_signals"] == 0
 
     async def test_hours_filter_applied(self, store, mock_qdrant, mock_embed):
-        mock_qdrant.search.return_value = []
+        mock_qdrant.query_points.return_value.points = []
         await store.cross_domain_correlate("test", hours=12.0)
 
-        call_kwargs = mock_qdrant.search.call_args.kwargs
+        call_kwargs = mock_qdrant.query_points.call_args.kwargs
         assert call_kwargs["limit"] == 100  # Fetches 100 for cross-domain spread
 
 
