@@ -42,7 +42,7 @@ def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AOIStore:
 
 @pytest.fixture
 def client() -> TestClient:
-    return TestClient(dashboard_app.app)
+    return TestClient(dashboard_app.app, base_url="http://localhost:8501")
 
 
 def test_api_aois_empty(client: TestClient, store: AOIStore) -> None:
@@ -52,7 +52,7 @@ def test_api_aois_empty(client: TestClient, store: AOIStore) -> None:
     assert body["aois"] == []
     assert body["count"] == 0
     assert "error" not in body
-    assert r.headers.get("access-control-allow-origin") == "*"
+    assert "access-control-allow-origin" not in r.headers
 
 
 def test_api_aois_lists_geometry_and_last_sweep(

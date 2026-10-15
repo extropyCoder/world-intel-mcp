@@ -110,6 +110,23 @@ intel-dashboard              # http://localhost:8501
 intel-dashboard --port 9000  # custom port
 ```
 
+The dashboard binds to `127.0.0.1` by default. For a remote dashboard, keep
+that bind and use an SSH local forward, for example:
+
+```bash
+ssh -N -L 127.0.0.1:18501:127.0.0.1:8501 user@remote-host
+# Open http://localhost:18501 (or http://127.0.0.1:18501)
+```
+
+Only `localhost` and `127.0.0.1` Host names are accepted, including custom
+forwarded ports. Requests with an Origin must match the page's scheme,
+hostname and effective port exactly; the two loopback aliases are not
+interchangeable. Cross-origin access is not enabled. This is **browser
+isolation, not local-process authentication**: local programs can still access
+the dashboard. Do not expose it publicly. The launcher disables proxy-header
+trust; if running Uvicorn directly, also pass `--no-proxy-headers` so forwarded
+headers cannot rewrite the request scheme.
+
 ### PDF/HTML Reports
 
 ```bash

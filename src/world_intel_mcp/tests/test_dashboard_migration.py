@@ -86,7 +86,7 @@ def faked(monkeypatch: pytest.MonkeyPatch) -> dict:
 
 @pytest.fixture
 def client() -> TestClient:
-    return TestClient(dashboard_app.app)
+    return TestClient(dashboard_app.app, base_url="http://localhost:8501")
 
 
 def test_coordinates_attached_from_world_bank_capitals(client, faked) -> None:
@@ -94,7 +94,7 @@ def test_coordinates_attached_from_world_bank_capitals(client, faked) -> None:
     assert r.status_code == 200
     body = r.json()
     assert "error" not in body
-    assert r.headers.get("access-control-allow-origin") == "*"
+    assert "access-control-allow-origin" not in r.headers
     by_pair = {(c["origin_iso3"], c["destination_iso3"]): c for c in body["corridors"]}
     sdn_tcd = by_pair[("SDN", "TCD")]
     assert sdn_tcd["origin_point"] == {"lat": 15.5932, "lon": 32.5363, "capital": "Khartoum"}

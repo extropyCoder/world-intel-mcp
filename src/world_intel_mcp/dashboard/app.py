@@ -7,6 +7,7 @@ All data pulled from the same source modules used by the MCP server.
 import asyncio
 import json
 import logging
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +17,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parents[3] / ".env", override=False)
 
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
 from starlette.responses import HTMLResponse, JSONResponse, StreamingResponse
 from starlette.routing import Route
 
@@ -77,6 +79,60 @@ from world_intel_mcp.config.trade_routes import (
 from world_intel_mcp.sources.central_banks import fetch_central_bank_rates
 
 logger = logging.getLogger(__name__)
+
+
+def _loopback_authority(value: str) -> tuple[str, int | None] | None:
+    """Parse only the two supported browser hostnames, not general URLs."""
+    match = re.fullmatch(r"(localhost|127\.0\.0\.1)(?::([0-9]+))?", value, re.IGNORECASE)
+    if match is None:
+        return None
+    hostname, port = match.groups()
+    if port is not None:
+        # Bound conversion even for adversarially long digit strings.
+        port = port.lstrip("0")
+        if not port or len(port) > 5 or not 1 <= int(port) <= 65535:
+            return None
+        return hostname.lower(), int(port)
+    return hostname.lower(), None
+
+
+class BrowserIsolationMiddleware:
+    """Reject DNS rebinding and cross-origin browser requests before routing.
+
+    This is browser isolation, not authentication of local processes. Only raw
+    Host/Origin and the transport scheme are authoritative; never forwarded
+    headers. Run the ASGI server without proxy-header rewriting as well.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        hosts = [v.decode("latin-1") for k, v in scope["headers"] if k.lower() == b"host"]
+        host = _loopback_authority(hosts[0]) if len(hosts) == 1 else None
+        if host is None:
+            await JSONResponse({"error": "Invalid Host"}, status_code=400)(scope, receive, send)
+            return
+        origins = [v.decode("latin-1") for k, v in scope["headers"] if k.lower() == b"origin"]
+        if origins:
+            origin = re.fullmatch(r"(https?)://([^/\s?#]+)", origins[0], re.IGNORECASE)
+            authority = _loopback_authority(origin[2]) if origin else None
+            scheme = scope["scheme"]
+            default_port = {"http": 80, "https": 443}.get(scheme)
+            if (
+                len(origins) != 1
+                or origin is None
+                or authority is None
+                or origin[1].lower() != scheme
+                or (authority[0], authority[1] or default_port)
+                != (host[0], host[1] or default_port)
+            ):
+                await JSONResponse({"error": "Invalid Origin"}, status_code=403)(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
 
 # ---------------------------------------------------------------------------
 # Shared infrastructure — lazily initialised
@@ -338,7 +394,7 @@ async def index(request):
 async def api_overview(request):
     """REST endpoint — full snapshot of all intelligence domains."""
     data = await _fetch_overview()
-    return JSONResponse(data, headers={"Access-Control-Allow-Origin": "*"})
+    return JSONResponse(data)
 
 
 _CONFLICT_FEEDS = ("acled_events", "ucdp_events")
@@ -533,7 +589,6 @@ async def api_stream(request):
         headers={
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
-            "Access-Control-Allow-Origin": "*",
         },
     )
 
@@ -579,7 +634,6 @@ async def api_static(request):
                 "count": len(FINANCIAL_CENTERS),
             },
         },
-        headers={"Access-Control-Allow-Origin": "*"},
     )
 
 
@@ -593,7 +647,6 @@ async def api_aois(request):
     rather than a row of zeros, and a broken store is a 503 with the
     reason, never an empty list that reads as "no areas defined".
     """
-    cors = {"Access-Control-Allow-Origin": "*"}
     try:
         store = _open_aoi_store()
         try:
@@ -619,10 +672,9 @@ async def api_aois(request):
         return JSONResponse(
             {"error": f"AOI store unavailable: {exc}", "aois": [], "count": 0},
             status_code=503,
-            headers=cors,
         )
     return JSONResponse(
-        {"aois": aois, "count": len(aois), "source": "aoi-store"}, headers=cors
+        {"aois": aois, "count": len(aois), "source": "aoi-store"}
     )
 
 
@@ -673,16 +725,15 @@ async def api_migration(request):
     secondary: if only it fails, the largest corridors are still returned with
     ``rising_error`` set.
     """
-    cors = {"Access-Control-Allow-Origin": "*"}
     try:
         limit = int(request.query_params.get("limit", _MIGRATION_DEFAULT_LIMIT))
         year_param = request.query_params.get("year")
         year = int(year_param) if year_param else None
     except ValueError:
-        return JSONResponse({"error": "limit and year must be integers"}, status_code=400, headers=cors)
+        return JSONResponse({"error": "limit and year must be integers"}, status_code=400)
     if not 1 <= limit <= _MIGRATION_MAX_LIMIT:
         return JSONResponse(
-            {"error": f"limit must be between 1 and {_MIGRATION_MAX_LIMIT}"}, status_code=400, headers=cors
+            {"error": f"limit must be between 1 and {_MIGRATION_MAX_LIMIT}"}, status_code=400
         )
 
     fetcher = _ensure_fetcher()
@@ -696,15 +747,15 @@ async def api_migration(request):
         logger.warning("Migration layer unavailable: %s", exc)
         return JSONResponse(
             {"error": f"Migration fetch failed: {exc}", "corridors": [], "rising": []},
-            status_code=503, headers=cors,
+            status_code=503,
         )
     if "error" in flows:
-        return JSONResponse({**flows, "corridors": [], "rising": []}, status_code=503, headers=cors)
+        return JSONResponse({**flows, "corridors": [], "rising": []}, status_code=503)
     if wb is None:
         return JSONResponse(
             {"error": "World Bank country coordinates unavailable", "source": "worldbank",
              "corridors": [], "rising": []},
-            status_code=503, headers=cors,
+            status_code=503,
         )
 
     plotted, unplotted = _place_corridors(flows["corridors"], wb)
@@ -729,7 +780,7 @@ async def api_migration(request):
         rising, rising_unplotted = _place_corridors(surges["corridor_increases"], wb)
         payload.update(rising=rising, rising_unplotted=len(rising_unplotted),
                        compared_with=surges["compared_with"])
-    return JSONResponse(payload, headers=cors)
+    return JSONResponse(payload)
 
 
 async def api_health(request):
@@ -766,7 +817,6 @@ async def sse_vector_analytics(request):
         headers={
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
-            "Access-Control-Allow-Origin": "*",
         },
     )
 
@@ -808,7 +858,6 @@ async def api_vector_search(request):
         return JSONResponse(
             {"error": "Vector store not available (Qdrant not running)"},
             status_code=503,
-            headers={"Access-Control-Allow-Origin": "*"},
         )
 
     try:
@@ -817,7 +866,6 @@ async def api_vector_search(request):
         return JSONResponse(
             {"error": "Invalid JSON body"},
             status_code=400,
-            headers={"Access-Control-Allow-Origin": "*"},
         )
 
     query = body.get("query", "").strip()
@@ -825,7 +873,6 @@ async def api_vector_search(request):
         return JSONResponse(
             {"error": "Missing 'query' parameter"},
             status_code=400,
-            headers={"Access-Control-Allow-Origin": "*"},
         )
 
     hours = body.get("hours")
@@ -839,26 +886,13 @@ async def api_vector_search(request):
             category=category,
             hours=float(hours) if hours else None,
         )
-        return JSONResponse(results, headers={"Access-Control-Allow-Origin": "*"})
+        return JSONResponse(results)
     except Exception as exc:
         logger.exception("Vector search failed")
         return JSONResponse(
             {"error": str(exc)},
             status_code=500,
-            headers={"Access-Control-Allow-Origin": "*"},
         )
-
-
-async def api_vector_search_options(request):
-    """CORS preflight for vector search."""
-    return JSONResponse(
-        {},
-        headers={
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "POST, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type",
-        },
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -891,9 +925,9 @@ app = Starlette(
         Route("/api/report/pdf", api_report_pdf),
         Route("/sse/vector-analytics", sse_vector_analytics),
         Route("/api/vector-search", api_vector_search, methods=["POST"]),
-        Route("/api/vector-search", api_vector_search_options, methods=["OPTIONS"]),
     ],
     lifespan=lifespan,
+    middleware=[Middleware(BrowserIsolationMiddleware)],
 )
 
 
@@ -940,6 +974,7 @@ def run(host: str | None = None, port: int | None = None) -> None:
         port=port,
         log_level="info",
         access_log=False,
+        proxy_headers=False,
     )
 
 
