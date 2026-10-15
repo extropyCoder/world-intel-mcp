@@ -10,8 +10,10 @@ Requires native pango/gobject libs (``brew install pango`` on macOS).
 
 import asyncio
 import logging
+import math
 import time
 from datetime import datetime, timezone
+from html import escape
 from pathlib import Path
 from typing import Any
 
@@ -159,39 +161,67 @@ def _esc(text: Any) -> str:
     """Escape HTML special chars."""
     if text is None:
         return ""
-    s = str(text)
-    return (
-        s.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-    )
+    return escape(str(text), quote=True)
 
 
-def _fmt_num(val: Any, decimals: int = 2) -> str:
-    """Format a number with commas."""
+def _fmt_num(val: Any, decimals: int = 2, *, signed: bool = False, suffix: str = "") -> str:
+    """Return HTML-safe numeric text, or escaped invalid input.
+
+    Nonfinite and overflowing values are unavailable, not meaningful metrics.
+    ``decimals``, ``signed`` and ``suffix`` are renderer-controlled constants.
+    """
     if val is None:
         return "N/A"
     try:
         f = float(val)
-        if f == int(f) and decimals == 0:
-            return f"{int(f):,}"
-        return f"{f:,.{decimals}f}"
+        if not math.isfinite(f):
+            return "N/A"
+        return f"{f:{'+' if signed else ''},.{decimals}f}{suffix}"
     except (ValueError, TypeError):
-        return str(val)
+        return _esc(val)
+    except OverflowError:
+        return "N/A"
 
 
 def _change_class(val: Any) -> str:
     """Return CSS class based on +/- value."""
     try:
         v = float(val)
+        if not math.isfinite(v):
+            return ""
         if v > 0:
             return "green"
         elif v < 0:
             return "red"
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
         pass
     return ""
+
+
+def _fmt_timestamp(value: Any) -> str:
+    """Format an upstream epoch in milliseconds without trusting its type/range."""
+    if value is None or value == 0:
+        return ""
+    try:
+        return datetime.fromtimestamp(float(value) / 1000, tz=timezone.utc).strftime(
+            "%Y-%m-%d %H:%M UTC"
+        )
+    except (ValueError, TypeError, OverflowError, OSError):
+        return "N/A"
+
+
+class _ReportResourceBlocker:
+    """Deny every PDF resource URL, including file:, data: and network URLs.
+
+    Callable fetchers work with WeasyPrint 62+. Version 70 also checks this
+    error-policy attribute when wrapping fetch errors. Missing resources may
+    be omitted by the renderer, but must never fall back to its default loader.
+    """
+
+    _fail_on_errors = False
+
+    def __call__(self, url):
+        raise ValueError("URL resource loading is disabled for reports")
 
 
 # ---------------------------------------------------------------------------
@@ -210,7 +240,7 @@ def _render_markets(data: dict) -> str:
         name = _esc(q.get("shortName") or q.get("symbol", ""))
         price = _fmt_num(q.get("regularMarketPrice"))
         chg = q.get("regularMarketChangePercent")
-        chg_str = f"{float(chg):+.2f}%" if chg is not None else "N/A"
+        chg_str = _fmt_num(chg, signed=True, suffix="%")
         cls = _change_class(chg)
         rows.append(
             f'<tr><td>{name}</td><td>{price}</td><td><span class="metric {cls}">{chg_str}</span></td></tr>'
@@ -234,14 +264,7 @@ def _render_earthquakes(data: dict) -> str:
         props = q.get("properties", {})
         mag = _fmt_num(props.get("mag"), 1)
         place = _esc(props.get("place", "Unknown"))
-        t = props.get("time")
-        time_str = (
-            datetime.fromtimestamp(t / 1000, tz=timezone.utc).strftime(
-                "%Y-%m-%d %H:%M UTC"
-            )
-            if t
-            else ""
-        )
+        time_str = _fmt_timestamp(props.get("time"))
         rows.append(f"<tr><td>{mag}</td><td>{place}</td><td>{time_str}</td></tr>")
 
     return f"""
@@ -261,7 +284,7 @@ def _render_conflicts(data: dict) -> str:
     for e in events[:12]:
         etype = _esc(e.get("event_type", ""))
         country = _esc(e.get("country", ""))
-        fatalities = e.get("fatalities", 0)
+        fatalities = _esc(e.get("fatalities", 0))
         date = _esc(e.get("event_date", ""))
         notes = _esc(str(e.get("notes", ""))[:120])
         rows.append(
@@ -284,7 +307,7 @@ def _render_news_clusters(data: dict) -> str:
     items = []
     for c in clusters[:8]:
         title = _esc(c.get("label") or c.get("title", ""))
-        count = c.get("article_count", c.get("count", ""))
+        count = _esc(c.get("article_count", c.get("count", "")))
         items.append(f"<li><strong>{title}</strong> ({count} articles)</li>")
     return f"<ul>{''.join(items)}</ul>"
 
@@ -350,7 +373,7 @@ def _render_infrastructure(data: dict) -> str:
     rows = []
     for o in outages[:8]:
         name = _esc(o.get("entity") or o.get("name", ""))
-        score = o.get("score") or o.get("severity", "")
+        score = _esc(o.get("score") or o.get("severity", ""))
         source = _esc(o.get("source", ""))
         rows.append(f"<tr><td>{name}</td><td>{score}</td><td>{source}</td></tr>")
 
@@ -371,8 +394,8 @@ def _render_cyber(data: dict) -> str:
     for t in threats[:8]:
         name = _esc(t.get("name") or t.get("tag", ""))
         ttype = _esc(t.get("type", ""))
-        url = _esc(t.get("url", ""))
-        rows.append(f"<tr><td>{name}</td><td>{ttype}</td><td>{url[:60]}</td></tr>")
+        url = _esc(str(t.get("url") or "")[:60])
+        rows.append(f"<tr><td>{name}</td><td>{ttype}</td><td>{url}</td></tr>")
 
     return f"""
     <table>
@@ -702,7 +725,7 @@ async def generate_report(
         from weasyprint import HTML as WeasyHTML
 
         pdf_bytes: bytes = await asyncio.to_thread(
-            lambda: WeasyHTML(string=html).write_pdf()  # type: ignore[return-value]
+            lambda: WeasyHTML(string=html, url_fetcher=_ReportResourceBlocker()).write_pdf()  # type: ignore[return-value]
         )
         output_path.write_bytes(pdf_bytes)
     else:

@@ -1,5 +1,8 @@
 """Tests for the PDF/HTML intelligence report generator."""
 
+import sys
+from html.parser import HTMLParser
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -23,6 +26,7 @@ from world_intel_mcp.reports import (
     _render_key_value,
     _collect_report_data,
     _safe_fetch,
+    _ReportResourceBlocker,
     pdf_dependencies_available,
     generate_report,
 )
@@ -480,3 +484,230 @@ class TestGenerateReport:
 
         content = output.read_text()
         assert "Daily Brief" in content
+
+
+# ---------------------------------------------------------------------------
+# Untrusted feed values and the PDF resource boundary
+# ---------------------------------------------------------------------------
+
+_PAYLOAD = '<img src=x>&"\''
+
+
+def _nested_field(path, value):
+    for key in reversed(path):
+        value = [value] if key == 0 else {key: value}
+    return value
+
+
+_DYNAMIC_FIELDS = [
+    (_render_markets, ("quotes", 0, field)) for field in (
+        "shortName", "symbol", "regularMarketPrice", "regularMarketChangePercent")
+] + [
+    (_render_earthquakes, ("earthquakes", 0, "properties", field)) for field in ("mag", "place")
+] + [
+    (_render_conflicts, ("events", 0, field)) for field in (
+        "event_type", "country", "fatalities", "event_date", "notes")
+] + [
+    (_render_news_clusters, ("clusters", 0, field)) for field in (
+        "label", "title", "article_count", "count")
+] + [
+    (_render_alerts, ("alerts", 0, field)) for field in ("title", "type", "detail", "description")
+] + [
+    (_render_posture, (field,)) for field in (
+        "overall_assessment", "summary", "threat_level", "risk_level")
+] + [
+    (_render_posture, ("regions", "Region")),
+    (_render_posture, ("regional_assessments", "Region", "summary")),
+] + [
+    (_render_infrastructure, ("outages", 0, field)) for field in (
+        "entity", "name", "score", "severity", "source")
+] + [
+    (_render_cyber, ("threats", 0, field)) for field in ("name", "tag", "type", "url")
+] + [
+    (_render_health, ("outbreaks", 0, field)) for field in ("disease", "title", "country", "date")
+] + [
+    (_render_maritime, ("vessels", 0, field)) for field in (
+        "name", "vessel_name", "type", "ship_type", "flag")
+] + [
+    (_render_situation_brief, (field,)) for field in ("brief", "summary")
+] + [(_render_key_value, ("metric",))]
+
+
+class _Elements(HTMLParser):
+    def __init__(self, html):
+        super().__init__(convert_charrefs=True)
+        self.tags = []
+        self.feed(html)
+
+    def handle_starttag(self, tag, attrs):
+        self.tags.append(tag)
+
+
+@pytest.mark.parametrize("renderer,path", _DYNAMIC_FIELDS)
+def test_dynamic_fields_are_escaped_once(renderer, path):
+    data = _nested_field(path, _PAYLOAD)
+    if renderer is _render_posture and not ({"overall_assessment", "summary"} & data.keys()):
+        data["overall_assessment"] = "Assessment"
+    html = renderer(data)
+    assert _esc(_PAYLOAD) in html
+    assert "&amp;lt;img" not in html
+    assert "img" not in _Elements(html).tags
+
+
+def test_dynamic_keys_and_severity_cannot_create_markup():
+    for html in (
+        _render_key_value({_PAYLOAD: _PAYLOAD}),
+        _render_posture({"summary": "Summary", "regions": {_PAYLOAD: "Detail"}}),
+    ):
+        assert _esc(_PAYLOAD) in html
+        assert "img" not in _Elements(html).tags
+    html = _render_alerts({"alerts": [{"severity": _PAYLOAD, "title": "Alert"}]})
+    assert _PAYLOAD not in html
+    assert 'class="alert-box "' in html
+    assert "img" not in _Elements(html).tags
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf"),
+                                  "NaN", "Infinity", "1e9999", 10 ** 1000])
+def test_nonfinite_or_overflowing_numbers_are_unavailable(value):
+    assert _fmt_num(value) == "N/A"
+    assert _fmt_num(value, 0) == "N/A"
+    assert _change_class(value) == ""
+    html = _render_markets({"quotes": [{"regularMarketPrice": value,
+                                       "regularMarketChangePercent": value}]})
+    assert html.count("N/A") == 2
+
+
+@pytest.mark.parametrize("value", [_PAYLOAD, "bad", {}, [], None,
+                                  float("nan"), float("inf"), 10 ** 1000, -1e300])
+def test_invalid_epoch_does_not_crash_or_interpolate(value):
+    html = _render_earthquakes({"earthquakes": [{"properties": {"time": value}}]})
+    assert "img" not in _Elements(html).tags
+    assert "N/A" in html or value is None
+
+
+@pytest.mark.parametrize("value", [_PAYLOAD, {"value": _PAYLOAD}, [_PAYLOAD]])
+def test_invalid_numeric_fallback_is_html_safe(value):
+    assert _fmt_num(value) == _esc(value)
+    assert _change_class(value) == ""
+    assert "img" not in _Elements(_fmt_num(value)).tags
+
+
+def test_truncation_precedes_escaping():
+    url = "x" * 59 + "<&"
+    html = _render_cyber({"threats": [{"url": url}]})
+    assert "x" * 59 + "&lt;</td>" in html
+
+
+@pytest.mark.parametrize("payload", [
+    '<img src="http://example.invalid/image">',
+    '<link rel="stylesheet" href="file:///not-a-real-report-resource.css">',
+    '<style>@import "https://example.invalid/style";</style>',
+    '<a rel="attachment" href="data:text/plain,blocked">attachment</a>',
+    '<script>alert("not markup")</script>',
+])
+async def test_generated_html_escapes_title_and_vulnerable_fields(tmp_path, payload):
+    output = tmp_path / "safe.html"
+    data = {
+        "markets": {"quotes": [{"regularMarketPrice": payload, "regularMarketChangePercent": payload}]},
+        "conflicts": {"events": [{"fatalities": payload}]},
+        "news": {"clusters": [{"article_count": payload}, {"count": payload}]},
+        "infrastructure": {"outages": [{"score": payload}, {"severity": payload}]},
+    }
+    with patch("world_intel_mcp.reports._collect_report_data", AsyncMock(return_value=data)):
+        await generate_report(MagicMock(), output_path=output, title=payload, fmt="html")
+    html = output.read_text()
+    assert payload not in html
+    assert html.count(_esc(payload)) == 8
+    assert not {"img", "link", "a", "script"} & set(_Elements(html).tags)
+    assert _Elements(html).tags.count("style") == 1  # trusted report CSS only
+
+
+@pytest.mark.parametrize("url", ["file:///not-a-real-resource", "http://example.invalid/",
+                                "https://example.invalid/", "data:text/plain,blocked",
+                                "ftp://example.invalid/", "relative.png", ""])
+def test_pdf_resource_blocker_denies_every_url(url):
+    with pytest.raises(ValueError, match="resource loading is disabled"):
+        _ReportResourceBlocker()(url)
+
+
+async def test_pdf_generation_passes_restrictive_loader(tmp_path, monkeypatch):
+    """Assert the actual production constructor boundary, even without WeasyPrint."""
+    constructor = MagicMock()
+    constructor.return_value.write_pdf.return_value = b"%PDF-stub"
+    monkeypatch.setitem(sys.modules, "weasyprint", SimpleNamespace(HTML=constructor))
+    with patch("world_intel_mcp.reports.pdf_dependencies_available", return_value=True), patch(
+        "world_intel_mcp.reports._collect_report_data", AsyncMock(return_value={})
+    ):
+        output = tmp_path / "report.pdf"
+        await generate_report(MagicMock(), output_path=output)
+    kwargs = constructor.call_args.kwargs
+    assert set(kwargs) == {"string", "url_fetcher"}
+    assert "<!DOCTYPE html>" in kwargs["string"]
+    assert isinstance(kwargs["url_fetcher"], _ReportResourceBlocker)
+    with pytest.raises(ValueError):
+        kwargs["url_fetcher"]("https://example.invalid/")
+    assert output.read_bytes() == b"%PDF-stub"
+
+
+def _weasyprint_or_skip():
+    try:
+        import weasyprint
+    except (ImportError, OSError) as exc:
+        pytest.skip(f"Optional WeasyPrint/native libraries unavailable: {exc}")
+    return weasyprint
+
+
+@pytest.mark.parametrize("kind", ["image", "css-link", "css-import", "css-url", "font-face",
+                                 "attachment", "attachment-link"])
+@pytest.mark.parametrize("scheme", ["file", "http", "https", "data"])
+async def test_real_pdf_resource_rejection(tmp_path, monkeypatch, kind, scheme):
+    """Exercise actual WeasyPrint via generate_report; never use its real loader.
+
+    Inject raw markup at the assembly boundary to test defense in depth even if
+    a future renderer accidentally omits escaping. All file paths are disposable
+    test files and all network names are .invalid; fallback IO is trapped too.
+    """
+    weasyprint = _weasyprint_or_skip()
+    from weasyprint import urls
+    from urllib import request
+    from world_intel_mcp import reports
+
+    resource = tmp_path / "resource.txt"
+    resource.write_text("test resource, not sensitive")
+    url = {"file": resource.as_uri(), "http": "http://example.invalid/resource",
+           "https": "https://example.invalid/resource", "data": "data:text/plain,blocked"}[scheme]
+    markup = {
+        "image": f'<img src="{url}">',
+        "css-link": f'<link rel="stylesheet" href="{url}">',
+        "css-import": f'<style>@import url("{url}");</style>',
+        "css-url": f'<div style="background-image:url({url});width:10px;height:10px">test</div>',
+        "font-face": f'<style>@font-face {{font-family:Blocked;src:url("{url}")}} '
+                     'body {font-family:Blocked}</style><p>test font</p>',
+        "attachment": f'<link rel="attachment" href="{url}" title="blocked">',
+        "attachment-link": f'<a rel="attachment" href="{url}">blocked</a>',
+    }[kind]
+    blocked = []
+    original = _ReportResourceBlocker.__call__
+
+    def record_rejection(self, target):
+        blocked.append(target)
+        return original(self, target)
+
+    # Trap default fetching across both the older function API and newer class
+    # API, so a regression cannot perform network or file-resource IO in tests.
+    fallback = MagicMock(side_effect=AssertionError("default resource loader invoked"))
+    monkeypatch.setattr(request.OpenerDirector, "open", fallback)
+    if hasattr(urls, "URLFetcher"):
+        monkeypatch.setattr(urls.URLFetcher, "fetch", fallback)
+    if hasattr(urls, "default_url_fetcher"):
+        monkeypatch.setattr(urls, "default_url_fetcher", fallback)
+        monkeypatch.setattr(weasyprint, "default_url_fetcher", fallback)
+    monkeypatch.setattr(_ReportResourceBlocker, "__call__", record_rejection)
+    monkeypatch.setattr(reports, "_collect_report_data", AsyncMock(return_value={}))
+    monkeypatch.setattr(reports, "_build_html", lambda *args: f"<html><body>{markup}</body></html>")
+    output = tmp_path / "blocked.pdf"
+    await generate_report(MagicMock(), output_path=output)
+    assert blocked == [url]
+    fallback.assert_not_called()
+    assert output.read_bytes().startswith(b"%PDF-")
