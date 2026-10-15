@@ -59,6 +59,33 @@ OSINT feeds. Its trust boundaries:
    and circuit-breaker state is visible via `intel_status`. Consumers
    that must not act on stale data must check the marker.
 
+## Upstream response limits
+
+GET bodies are streamed with cumulative **decoded-byte** caps: 32 MiB for
+JSON and text/XML, and 256 MiB for binary history downloads. Python callers
+can configure `Fetcher(max_json_bytes=..., max_text_bytes=...)` and pass
+`max_bytes=...` per GET; existing positional parameters are unchanged.
+Content-Length is not trusted. Oversized responses are closed, never retried
+or cached, and count as one circuit-breaker failure. JSON/text/XML use the
+existing stale fallback; binary calls return an error with no partial body.
+Redirect and HTTP-error bodies exposed to the fetcher are discarded without
+reading them. Client authentication is applied on the initial send only;
+redirects preserve HTTPX's Authorization stripping and retention decisions.
+
+The default fetcher client has no challenge authentication or body-reading
+hooks. For an injected `httpx.AsyncClient`, the streaming-cap guarantee
+requires authentication flows and hooks that do not consume response bodies
+themselves. HTTPX may buffer intermediate authentication responses (for
+example, Digest challenges) before returning control to the bounded reader;
+those internal reads are not capped here. Basic auth and explicit Authorization
+headers do not require challenge-body reads.
+
+These caps bound accepted body bytes, not total process memory: HTTPX may
+produce a larger individual decompressed chunk before the cap check, and
+parsing/decoding requires additional memory. Previously cached data is not
+re-sized by these network limits. Operator-configured outbound POST sinks
+are outside these GET limits; this is not a URL/SSRF policy.
+
 ## Report rendering
 
 Report titles and upstream values are rendered as escaped text, not trusted

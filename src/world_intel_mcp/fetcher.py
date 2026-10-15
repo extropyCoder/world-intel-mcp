@@ -6,8 +6,10 @@ response is returned (marked with _stale=True) so dashboards never go blank.
 """
 
 import asyncio
+import json
 import logging
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -17,6 +19,56 @@ from .cache import Cache
 from .circuit_breaker import CircuitBreaker
 
 logger = logging.getLogger("world-intel-mcp.fetcher")
+
+_DEFAULT_JSON_MAX_BYTES = 32 * 1024 * 1024
+_DEFAULT_TEXT_MAX_BYTES = 32 * 1024 * 1024
+_DEFAULT_BINARY_MAX_BYTES = 256 * 1024 * 1024
+
+
+class _ResponseTooLarge(ValueError):
+    """A decoded response exceeded its cap; retrying it would waste bandwidth."""
+
+
+def _validate_max_bytes(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("max_bytes must be a positive integer")
+    return value
+
+
+async def _read_bounded(response: httpx.Response, max_bytes: int) -> bytes:
+    """Accumulate only complete, capped decoded bodies, ignoring Content-Length.
+
+    HTTPX removes HTTP content encodings (gzip, etc.) in aiter_bytes. Check
+    each yielded chunk before retaining it, not compressed wire-byte counts.
+    The caller owns the response context and closes on every exit path.
+    """
+    body = bytearray()
+    async for chunk in response.aiter_bytes():
+        if len(body) + len(chunk) > max_bytes:
+            raise _ResponseTooLarge(f"decoded body exceeds cap {max_bytes} bytes")
+        body.extend(chunk)
+    return bytes(body)
+
+
+def _response_text(response: httpx.Response, body: bytes) -> str:
+    # Feed already-decoded bytes to HTTPX's normal text decoding, including
+    # charset validation, replacement errors and client default autodetection.
+    # Do not copy Content-Encoding: that would decompress the body twice.
+    if not body:
+        return ""
+    buffered = httpx.Response(
+        200,
+        content=body,
+        headers={"content-type": response.headers.get("content-type", "")},
+        default_encoding=response.default_encoding,
+    )
+    # Preserve any encoding selected explicitly by a response hook. Resolve
+    # the usual content-based default on the buffered bytes first, since the
+    # original streaming response has no .content for autodetection.
+    response.default_encoding = buffered.encoding
+    buffered.encoding = response.encoding
+    return buffered.text
+
 
 # Yahoo Finance requires serialized access (600ms gap)
 _yahoo_lock = asyncio.Lock()
@@ -79,6 +131,9 @@ class Fetcher:
         max_retries: int = 2,
         client: httpx.AsyncClient | None = None,
         vector_store: Any = None,
+        *,
+        max_json_bytes: int = _DEFAULT_JSON_MAX_BYTES,
+        max_text_bytes: int = _DEFAULT_TEXT_MAX_BYTES,
     ):
         self.cache = cache
         self.breaker = breaker
@@ -86,6 +141,8 @@ class Fetcher:
         self.max_retries = max_retries
         self._client: httpx.AsyncClient | None = client
         self.vector_store = vector_store  # VectorStore instance (optional)
+        self.max_json_bytes = _validate_max_bytes(max_json_bytes)
+        self.max_text_bytes = _validate_max_bytes(max_text_bytes)
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -102,6 +159,42 @@ class Fetcher:
         if self._client and not self._client.is_closed:
             await self._client.aclose()
             self._client = None
+
+    @asynccontextmanager
+    async def _stream_get(self, client: httpx.AsyncClient, url: str, **kwargs):
+        """Stream GETs, closing even unread redirects and failed/cancelled reads.
+
+        Automatic HTTPX redirects buffer intermediate bodies. Instead use its
+        prepared next_request (URL resolution, cookies, header stripping) while
+        discarding redirect bodies. Respect the client's redirect settings.
+
+        Client auth is applied only on the initial send. Injected clients must
+        not use body-consuming auth flows/hooks for the streaming cap guarantee:
+        HTTPX may buffer challenge responses internally before returning here.
+        """
+        request = client.build_request("GET", url, **kwargs)
+        redirects = 0
+        while True:
+            # Reapplying client auth would restore Authorization after HTTPX
+            # stripped it from a cross-origin/downgrade next_request. Same-origin
+            # credentials are already present on that prepared request.
+            auth_kwargs = {} if redirects == 0 else {"auth": None}
+            response = await client.send(
+                request, stream=True, follow_redirects=False, **auth_kwargs
+            )
+            try:
+                if client.follow_redirects and response.next_request is not None:
+                    if redirects >= client.max_redirects:
+                        raise httpx.TooManyRedirects(
+                            "Exceeded maximum allowed redirects.", request=request
+                        )
+                    request = response.next_request
+                    redirects += 1
+                    continue
+                yield response
+                return
+            finally:
+                await response.aclose()
 
     async def post(
         self,
@@ -134,6 +227,8 @@ class Fetcher:
         params: dict[str, Any] | None = None,
         timeout: float | None = None,
         yahoo_rate_limit: bool = False,
+        *,
+        max_bytes: int | None = None,
     ) -> dict | list | None:
         """Fetch JSON with caching, circuit breaking, and retries.
 
@@ -146,10 +241,12 @@ class Fetcher:
             params: Query parameters.
             timeout: Per-request timeout override.
             yahoo_rate_limit: If True, enforce Yahoo Finance 600ms serialization.
+            max_bytes: Decoded response cap; defaults to max_json_bytes (32 MiB).
 
         Returns:
             Parsed JSON or None on failure.
         """
+        max_bytes = _validate_max_bytes(self.max_json_bytes if max_bytes is None else max_bytes)
         # Check cache (live)
         effective_key = cache_key or f"{source}:{url}:{params}"
         cached = self.cache.get(effective_key)
@@ -172,19 +269,20 @@ class Fetcher:
 
         for attempt in range(self.max_retries + 1):
             try:
-                resp = await client.get(
+                async with self._stream_get(
+                    client,
                     url,
                     headers=headers,
                     params=params,
                     timeout=timeout or self.default_timeout,
-                )
-                resp.raise_for_status()
-                content_type = resp.headers.get("content-type", "")
-                if "html" in content_type and "json" not in content_type:
-                    raise ValueError(
-                        f"Expected JSON but got HTML from {source} ({url})"
-                    )
-                data = resp.json()
+                ) as resp:
+                    resp.raise_for_status()
+                    content_type = resp.headers.get("content-type", "")
+                    if "html" in content_type and "json" not in content_type:
+                        raise ValueError(
+                            f"Expected JSON but got HTML from {source} ({url})"
+                        )
+                    data = json.loads(await _read_bounded(resp, max_bytes))
                 if not isinstance(data, (dict, list)):
                     raise ValueError(
                         f"Expected dict/list from {source}, got {type(data).__name__}"
@@ -194,6 +292,9 @@ class Fetcher:
                 if self.vector_store:
                     await self.vector_store.store(source, data)
                 return data
+            except _ResponseTooLarge as exc:
+                last_error = exc
+                break
             except (httpx.HTTPStatusError, httpx.RequestError, Exception) as exc:
                 last_error = exc
                 if attempt < self.max_retries:
@@ -222,8 +323,11 @@ class Fetcher:
         headers: dict[str, str] | None = None,
         params: dict[str, Any] | None = None,
         timeout: float | None = None,
+        *,
+        max_bytes: int | None = None,
     ) -> str | None:
-        """Fetch raw text with caching and circuit breaking."""
+        """Fetch text with caching and a decoded-byte cap (default 32 MiB)."""
+        max_bytes = _validate_max_bytes(self.max_text_bytes if max_bytes is None else max_bytes)
         effective_key = cache_key or f"{source}:text:{url}:{params}"
         cached = self.cache.get(effective_key)
         if cached is not None:
@@ -239,17 +343,21 @@ class Fetcher:
 
         for attempt in range(self.max_retries + 1):
             try:
-                resp = await client.get(
+                async with self._stream_get(
+                    client,
                     url,
                     headers=headers,
                     params=params,
                     timeout=timeout or self.default_timeout,
-                )
-                resp.raise_for_status()
-                text = resp.text
+                ) as resp:
+                    resp.raise_for_status()
+                    text = _response_text(resp, await _read_bounded(resp, max_bytes))
                 self.breaker.record_success(source)
                 self.cache.set(effective_key, text, cache_ttl)
                 return text
+            except _ResponseTooLarge as exc:
+                last_error = exc
+                break
             except (httpx.HTTPStatusError, httpx.RequestError, Exception) as exc:
                 last_error = exc
                 if attempt < self.max_retries:
@@ -266,9 +374,13 @@ class Fetcher:
         cache_key: str | None = None,
         cache_ttl: int = 300,
         timeout: float | None = None,
+        *,
+        max_bytes: int | None = None,
     ) -> str | None:
         """Fetch XML content (returns raw text for feedparser/ET parsing)."""
-        return await self.get_text(url, source, cache_key, cache_ttl, timeout=timeout)
+        return await self.get_text(
+            url, source, cache_key, cache_ttl, timeout=timeout, max_bytes=max_bytes
+        )
 
     async def get_bytes(
         self,
@@ -276,15 +388,16 @@ class Fetcher:
         source: str,
         headers: dict[str, str] | None = None,
         timeout: float | None = None,
-        max_bytes: int = 256 * 1024 * 1024,
+        max_bytes: int = _DEFAULT_BINARY_MAX_BYTES,
     ) -> BinaryResult:
         """Fetch a binary body with rate limiting, retries and circuit breaking.
 
         Not cached here: binary payloads (multi-MB) do not belong in the
         SQLite TTL cache, so callers own any on-disk caching. A 404 is a
         definitive answer (not retried, not a breaker failure). A body
-        larger than ``max_bytes`` is refused rather than buffered.
+        larger than ``max_bytes`` decoded bytes is a failure, never retried.
         """
+        max_bytes = _validate_max_bytes(max_bytes)
         if not self.breaker.is_available(source):
             return BinaryResult(None, None, f"circuit open for {source}")
 
@@ -295,24 +408,20 @@ class Fetcher:
 
         for attempt in range(self.max_retries + 1):
             try:
-                resp = await client.get(
-                    url, headers=headers, timeout=timeout or self.default_timeout
-                )
-                last_status = resp.status_code
-                if resp.status_code == 404:
-                    self.breaker.record_success(source)
-                    return BinaryResult(404, None, None)
-                resp.raise_for_status()
-                body = resp.content
-                if len(body) > max_bytes:
-                    self.breaker.record_success(source)
-                    return BinaryResult(
-                        resp.status_code,
-                        None,
-                        f"body of {len(body)} bytes exceeds cap {max_bytes}",
-                    )
+                async with self._stream_get(
+                    client, url, headers=headers, timeout=timeout or self.default_timeout
+                ) as resp:
+                    last_status = resp.status_code
+                    if resp.status_code == 404:
+                        self.breaker.record_success(source)
+                        return BinaryResult(404, None, None)
+                    resp.raise_for_status()
+                    body = await _read_bounded(resp, max_bytes)
                 self.breaker.record_success(source)
                 return BinaryResult(resp.status_code, body, None)
+            except _ResponseTooLarge as exc:
+                last_error = str(exc)
+                break
             except (httpx.HTTPStatusError, httpx.RequestError) as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
                 if attempt < self.max_retries:
