@@ -144,6 +144,140 @@ not reflected in mode bits. POSIX no-follow/descriptor support is required;
 unsupported platforms fail closed. AOI connections share the path prepared by
 `Cache`; independently constructed AOI stores are not hardened by this change.
 
+## Redirect boundaries
+
+Webhook POSTs never follow redirects. GET redirects reject HTTPS-to-HTTP
+transitions and targets containing userinfo. Across origins, only Accept,
+Accept-Encoding, User-Agent, HTTPX-prepared Authorization/cookies, and destination
+Host are retained; same-origin headers remain unchanged. Redirect-policy refusals
+are terminal and preserve existing stale fallback.
+
+These redirect/header controls are separate from the GET address policy below.
+Default owned GETs enforce public addresses at connection time, including after
+redirects. Trusted environment/injected profiles can still reach private targets.
+Trusted hooks that modify requests are outside the redirect-header guarantee;
+strict transport separately checks URL/Host/SNI consistency.
+
+## Fetcher GET profiles and public-address transport
+
+Fetcher selects its GET profile from constructor configuration, not tool arguments,
+source labels, headers or upstream content:
+
+| Configuration | GET mode (`get_transport_mode`) | Address guarantee |
+|---|---|---|
+| Owned client, default `trust_env=False` | `strict-public` | Strict-direct public-address transport |
+| Owned client, deliberate `trust_env=True` | `trusted-environment` | Normal HTTPX environment/proxy routing; **not strict** |
+| Open injected client | `trusted-injected` | Operator-supplied routing/configuration; **outside this guarantee** |
+
+The mode is exposed as a diagnostic property and logged as a static label when
+first used or changed. Labels contain no proxy URLs, certificates or credentials.
+`trust_env` is a constructor-only bool; there is no per-GET safety-profile override.
+Runtime, dashboard and collector default construction therefore uses strict GETs.
+If an injected client closes, replacement follows the constructor's owned policy.
+Do not modify private client transports/mounts or inject body-consuming auth/hooks
+and assume the owned-client guarantees still apply.
+
+Strict owned GETs use `PublicSourceTransport` over a direct-only httpcore pool,
+with HTTPX `trust_env=False`, no proxy/mount overrides, HTTP/1.1 enabled and no
+mandatory HTTP/2 dependency. The configured SSLContext, request timeouts and
+200-connection/40-keepalive limits reach that pool. On **each new connection**,
+all DNS answers must pass the public-IP gate before any dialing; mixed public/
+nonpublic answers fail closed. Only canonical numeric approved addresses are
+passed to the connector, never the hostname as a fallback. Existing connections
+remain pinned to their vetted socket; replacement connections resolve and check
+again. This avoids a separate unguarded second hostname lookup at connection time.
+
+The gate denies non-global, private, loopback, link-local, unspecified, multicast,
+reserved and site-local addresses, plus explicit special-purpose exclusions.
+Those exclusions include IPv4/IPv6 documentation/benchmark/CGNAT ranges under the
+classification policy, Azure's platform VIP `168.63.129.16`, NAT64 prefixes, 6to4,
+Teredo/IETF assignment blocks and deprecated compatible IPv4. IPv4-mapped IPv6 is
+normalized and checked as IPv4; scoped addresses are rejected. Legacy numeric
+hostname spellings go through resolution and the same complete-answer gate.
+These conservative denials may reject unusual legitimate deployments.
+
+Host and HTTPS TLS SNI/certificate identity remain the original URL authority,
+not the numeric dial address. The transport refuses inconsistent Host/SNI and
+requires certificate plus hostname verification, including rechecking the context
+on pooled requests. An explicit verifying private-CA context is supported;
+`verify=False` or a non-verifying context **cannot silently disable strict GET
+enforcement** and will fail client construction. Insecure verification remains an
+explicit, discouraged option only for operator POST/trusted HTTPX profiles.
+Offline tests use fake DNS/TCP/TLS with real HTTPX/httpcore pools: they verify
+identity/context propagation and failure handling, **not live certificates**.
+
+DNS waiting defaults to at most 5 seconds; DNS plus TCP establishment shares a
+10-second maximum budget, reduced by a shorter request connect timeout. At most
+32 resolver answers are accepted. Sequential numeric-address fallback shares the
+remaining budget and has no unguarded hostname fallback. Cancellation propagates;
+failed/cancelled TLS upgrade closes the established TCP stream. System resolution
+uses an executor thread: timeout/cancellation stops waiting, not libc work already
+running. Answer-count bounds apply after resolution, not inside libc. These are
+not whole-request CPU/memory/latency limits.
+
+`PublicSourcePolicyError` is terminal: no retry/backoff, one breaker failure, no
+new cache/vector writes, and existing stale fallback for JSON/text/XML. Binary
+failures return no partial body. Existing cache hits are not revalidated as new
+network destinations. Ordinary transient connection failures retain retry rules.
+
+Owned operator webhook POSTs use a **separate unrestricted pool**, with no public
+address restriction and no redirect following. Local operator sinks remain valid;
+Cleanup attempts both GET/POST pools even if one close fails. Open injected clients retain
+their configuration and can serve both methods. No direct Ollama/other AI, ACLED,
+urllib or Qdrant client defaults are changed by this integration.
+
+This is not full application SSRF protection: trusted profiles and separate
+clients are outside the address guarantee, public HTTP remains allowed, and there
+is no public-service/port/path allowlist. Publicly routed services can themselves
+proxy to private systems; routing/NAT and other metadata endpoints require their
+own review and egress controls. Server deployment/TLS/DNS behavior still requires
+integration validation. Offline transport/Fetcher tests cover HTTPX **0.27.1 and
+0.28.1**, both with httpcore **1.0.9**. The 0.27.1 run uses the reviewer's official
+wheel overlay; this does not establish live DNS/TLS/server behavior or compatibility
+with every version admitted by the dependency ranges.
+
+## Fetcher-owned client environment trust
+
+HTTPX clients created by `Fetcher` explicitly default to `trust_env=False`.
+HTTPX's environment proxy discovery (HTTP_PROXY, HTTPS_PROXY, ALL_PROXY,
+NO_PROXY and supported lowercase forms) and its SSL_CERT_FILE/SSL_CERT_DIR
+CA overrides are therefore disabled for those clients. TLS verification remains
+enabled with HTTPX's default CA configuration. Merely setting `proxy=None`
+would not disable environment discovery; this policy uses `trust_env` instead.
+
+Python integrations can deliberately opt in with `Fetcher(cache, breaker,
+trust_env=True)`. This re-enables HTTPX-supported proxy discovery, NO_PROXY
+bypasses and environment CA selection when using default verification. Treat
+that process environment as trusted configuration. The option must be an actual
+bool; strings such as `"false"`, integers and None are rejected, not interpreted
+as truthy settings. Stock runtime/dashboard/collector construction uses the
+default; no new CLI flag or WORLD_INTEL_TRUST_ENV environment switch is added.
+See the README's Python configuration examples for opt-in/private CA setup.
+
+Environment CA path errors retain HTTPX's own version-specific behavior: 0.27.1
+ignores nonexistent SSL_CERT_FILE/SSL_CERT_DIR paths and uses its default roots;
+0.28.1 attempts the configured SSL_CERT_FILE and raises if it is missing. An
+existing malformed CA file raises `ssl.SSLError` in both tested versions. No new
+path-existence policy is imposed here. Explicit verifying contexts avoid this
+environment-selection ambiguity; valid capath directories load roots lazily.
+
+Use `Fetcher(..., verify=<ssl.SSLContext>)` for an explicitly loaded private CA
+without enabling environment trust. `verify` accepts only a bool or SSLContext,
+not deprecated path-string configuration. Invalid types fail at construction.
+`verify=False` is an explicit TLS-verification opt-out, **not recommended** and
+never the default; it is rejected by strict GET construction. An explicit context
+takes precedence over HTTPX CA overrides; its trust roots are the caller's
+responsibility. Strict GETs require verification to remain enabled.
+
+An open injected `httpx.AsyncClient` is reused unchanged: its explicit proxy,
+CA/context, `trust_env`, mounts and other configuration are not rewritten by
+these constructor options. If a closed client is replaced, the new owned client
+uses the Fetcher's settings. Environment opt-in deliberately selects the trusted
+HTTPX GET profile, not a proxy bolted onto the strict pool; NO_PROXY bypasses are
+also outside strict enforcement. It must not be mistaken for strict protection.
+The separate owned POST pool uses the same environment/CA settings but no public
+address gate. Separately constructed clients remain outside this policy.
+
 ## Upstream response limits
 
 GET bodies are streamed with cumulative **decoded-byte** caps: 32 MiB for
@@ -219,6 +353,25 @@ requests require additional memory. There are no general JSON depth/node limits
 or process isolation in this patch. Previously cached JSON/text data is not
 re-sized by these network limits. Operator-configured outbound POST sinks
 are outside these GET limits; this is not a URL/SSRF policy.
+
+## Feed content parsing
+
+Downloaded RSS/Atom bodies in news, service status, health, AI watch,
+Meteoalarm, JTWC, volcano and USNI fleet sources go through the shared
+`parse_feed_content` helper. It passes an in-memory `BytesIO` to feedparser,
+not a bare string/bytes value that feedparser can interpret as a URL or local
+filename. URL/path-shaped response bodies therefore cannot trigger feedparser's
+resource-locator fetch/open path. Text retains the previous inline-content
+UTF-8 conversion; byte content is preserved for XML declaration/BOM detection.
+This does not recover original HTTP bytes from already-decoded text or correct
+pre-existing conflicting encoding declarations. Existing feed entry processing
+and feedparser's own parsing/sanitization defaults remain unchanged.
+
+Offline tests use the actual installed parser with urllib, file-open and socket
+boundaries blocked, including all eight source handlers. This is a narrow fix
+for **content-driven secondary resource loading**; it is not a general SSRF,
+redirect, proxy, webhook, arbitrary XML safety or parser-memory policy. This
+parser boundary does not replace GET transport checks or govern other URL consumers.
 
 ## Report rendering
 

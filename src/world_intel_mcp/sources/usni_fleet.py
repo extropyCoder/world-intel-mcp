@@ -10,6 +10,7 @@ import re
 from datetime import datetime, timezone
 
 from ..fetcher import Fetcher
+from ..feed_parser import parse_feed_content
 
 try:
     import feedparser
@@ -235,7 +236,7 @@ async def fetch_usni_fleet(fetcher: Fetcher) -> dict:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
-    feed = feedparser.parse(xml)
+    feed = parse_feed_content(xml)
 
     if not feed.entries:
         return {

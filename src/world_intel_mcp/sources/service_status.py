@@ -9,6 +9,7 @@ import logging
 from datetime import datetime, timezone
 
 from ..fetcher import Fetcher
+from ..feed_parser import parse_feed_content
 
 try:
     import feedparser
@@ -170,7 +171,7 @@ async def fetch_service_status(
             logger.debug("No data from %s status feed", feed["provider"])
             return (feed["provider"], None)
 
-        parsed = feedparser.parse(xml_text)
+        parsed = parse_feed_content(xml_text)
         incidents: list[dict] = []
 
         for entry in parsed.get("entries", [])[:limit]:

@@ -9,6 +9,7 @@ import logging
 from datetime import datetime, timezone
 
 from ..fetcher import Fetcher
+from ..feed_parser import parse_feed_content
 
 try:
     import feedparser
@@ -108,7 +109,7 @@ async def fetch_disease_outbreaks(
             logger.debug("No data from health feed %s", name)
             return []
 
-        parsed = feedparser.parse(xml_text)
+        parsed = parse_feed_content(xml_text)
         items: list[dict] = []
 
         for entry in parsed.get("entries", [])[:30]:

@@ -8,10 +8,12 @@ response is returned (marked with _stale=True) so dashboards never go blank.
 import asyncio
 import json
 import logging
+import ssl
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -22,6 +24,7 @@ from .bounded_decode import (
 )
 from .circuit_breaker import CircuitBreaker
 from .diagnostics import exception_summary, redact_text, safe_error, safe_url
+from .public_transport import PublicSourcePolicyError, PublicSourceTransport
 
 logger = logging.getLogger("world-intel-mcp.fetcher")
 
@@ -31,6 +34,16 @@ _DEFAULT_BINARY_MAX_BYTES = 256 * 1024 * 1024
 
 
 _ResponseTooLarge = ResponseTooLarge
+
+
+class RedirectPolicyError(Exception):
+    """Terminal redirect refusal; messages intentionally contain no URLs."""
+
+
+def _origin(url: httpx.URL) -> tuple[str, str, int | None]:
+    """Compare HTTPX-normalized names with effective HTTP(S) ports."""
+    port = url.port if url.port is not None else {"http": 80, "https": 443}.get(url.scheme.lower())
+    return url.scheme.lower(), url.host.lower(), port
 
 
 def _validate_max_bytes(value: int) -> int:
@@ -156,7 +169,14 @@ _source_last_call: dict[str, float] = {}
 
 
 class Fetcher:
-    """Centralized HTTP fetcher with caching, retries, and circuit breaking."""
+    """Centralized HTTP fetcher with caching, retries, and circuit breaking.
+
+    Default owned GETs use strict-direct public-address transport. trust_env=True
+    opts into trusted HTTPX proxy/CA behavior, outside that address guarantee.
+    Open injected clients remain trusted/custom. Owned POSTs have a separate,
+    unrestricted operator-sink pool. verify can supply an explicit SSLContext;
+    strict GETs require certificate and hostname verification.
+    """
 
     def __init__(
         self,
@@ -171,17 +191,42 @@ class Fetcher:
         max_text_bytes: int = _DEFAULT_TEXT_MAX_BYTES,
         max_encoded_bytes: int | None = None,
         processing_timeout: float = DEFAULT_PROCESSING_TIMEOUT,
+        trust_env: bool = False,
+        verify: ssl.SSLContext | bool = True,
     ):
+        if not isinstance(trust_env, bool):
+            raise ValueError("trust_env must be a bool")
+        if not isinstance(verify, (bool, ssl.SSLContext)):
+            raise ValueError("verify must be a bool or SSLContext")
         self.cache = cache
         self.breaker = breaker
         self.default_timeout = default_timeout
         self.max_retries = max_retries
         self._client: httpx.AsyncClient | None = client
+        self._owned_get_client: httpx.AsyncClient | None = None
+        self._post_client: httpx.AsyncClient | None = None
+        self._reported_get_mode: str | None = None
         self.vector_store = vector_store  # VectorStore instance (optional)
         self.max_json_bytes = _validate_max_bytes(max_json_bytes)
         self.max_text_bytes = _validate_max_bytes(max_text_bytes)
         self.max_encoded_bytes = None if max_encoded_bytes is None else positive_bytes(max_encoded_bytes)
         self.processing_timeout = _validate_processing_timeout(processing_timeout)
+        # These apply only when we create a client, never to an injected client.
+        self._trust_env = trust_env
+        self.verify = verify
+
+    @property
+    def trust_env(self) -> bool:
+        """Constructor-only environment/trusted transport opt-in."""
+        return self._trust_env
+
+    @property
+    def get_transport_mode(self) -> str:
+        """Safe diagnostic label, not a claim about a custom client's transport."""
+        if (self._client is not None and not self._client.is_closed
+                and self._client is not self._owned_get_client):
+            return "trusted-injected"
+        return "trusted-environment" if self.trust_env else "strict-public"
 
     async def _read_body(self, response, max_bytes, max_encoded_bytes, processing_timeout):
         return await _read_bounded(
@@ -192,19 +237,61 @@ class Fetcher:
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
+            if self._owned_get_client is not None and not self._owned_get_client.is_closed:
+                await self._owned_get_client.aclose()
+            limits = httpx.Limits(max_connections=200, max_keepalive_connections=40)
+            options = {}
+            if not self.trust_env:
+                context = httpx.create_ssl_context(verify=self.verify, trust_env=False)
+                options["transport"] = PublicSourceTransport(ssl_context=context, limits=limits)
             self._client = httpx.AsyncClient(
                 timeout=httpx.Timeout(self.default_timeout),
                 follow_redirects=True,
-                limits=httpx.Limits(max_connections=200, max_keepalive_connections=40),
+                limits=limits,
                 headers={"User-Agent": "PhoenixAGI-WorldIntel/0.1"},
-                proxy=None,  # never inherit system SOCKS proxy
+                trust_env=self.trust_env,
+                verify=self.verify,
+                **options,
             )
+            self._owned_get_client = self._client
+        mode = self.get_transport_mode
+        if mode != self._reported_get_mode:
+            logger.info("Fetcher GET transport mode: %s", mode)
+            self._reported_get_mode = mode
         return self._client
 
+    async def _get_post_client(self) -> httpx.AsyncClient:
+        if (self._client is not None and not self._client.is_closed
+                and self._client is not self._owned_get_client):
+            return self._client
+        if self._post_client is None or self._post_client.is_closed:
+            self._post_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(self.default_timeout),
+                follow_redirects=False,
+                limits=httpx.Limits(max_connections=200, max_keepalive_connections=40),
+                headers={"User-Agent": "PhoenixAGI-WorldIntel/0.1"},
+                trust_env=self.trust_env,
+                verify=self.verify,
+            )
+        return self._post_client
+
     async def close(self) -> None:
-        if self._client and not self._client.is_closed:
-            await self._client.aclose()
-            self._client = None
+        # Include a previously owned GET pool if a trusted integration replaced
+        # _client. Close every distinct pool even if one close fails/cancels.
+        clients = {id(client): client for client in (
+            self._client, self._owned_get_client, self._post_client,
+        ) if client is not None}
+        self._client = self._owned_get_client = self._post_client = None
+        error = None
+        for client in clients.values():
+            try:
+                if not client.is_closed:
+                    await client.aclose()
+            except BaseException as exc:
+                if error is None:
+                    error = exc
+        if error is not None:
+            raise error
 
     @asynccontextmanager
     async def _stream_get(self, client: httpx.AsyncClient, url: str, **kwargs):
@@ -213,10 +300,16 @@ class Fetcher:
         Automatic HTTPX redirects buffer intermediate bodies. Instead use its
         prepared next_request (URL resolution, cookies, header stripping) while
         discarding redirect bodies. Respect the client's redirect settings.
+        Refuse HTTPS downgrades and redirect userinfo. Across origins, retain
+        only negotiation/identity headers and HTTPX-prepared auth/cookies.
+        Address enforcement belongs to the selected GET transport, independently
+        of these redirect/header rules. Trusted/custom clients are not guarded.
 
         Client auth is applied only on the initial send. Injected clients must
         not use body-consuming auth flows/hooks for the streaming cap guarantee:
         HTTPX may buffer challenge responses internally before returning here.
+        Trusted request hooks can modify prepared requests after our checks and
+        are outside the redirect-header guarantee.
         """
         request = client.build_request("GET", url, **kwargs)
         request.headers["Accept-Encoding"] = "gzip, deflate"
@@ -235,7 +328,25 @@ class Fetcher:
                         raise httpx.TooManyRedirects(
                             "Exceeded maximum allowed redirects.", request=request
                         )
-                    request = response.next_request
+                    next_request = response.next_request
+                    if (next_request.url.userinfo or
+                            "@" in urlsplit(response.headers["location"]).netloc):
+                        # auth=None does not disable HTTPX's URL-derived Basic auth.
+                        raise RedirectPolicyError("redirect URL userinfo is forbidden")
+                    if request.url.scheme == "https" and next_request.url.scheme == "http":
+                        raise RedirectPolicyError("HTTPS to HTTP redirect is forbidden")
+                    if _origin(request.url) != _origin(next_request.url):
+                        # Use ONLY HTTPX's prepared headers, never client defaults
+                        # or original call headers. Preserve its auth exception
+                        # for same-host HTTP->HTTPS and its cookie-jar rebuilding.
+                        allowed = {b"accept", b"accept-encoding", b"user-agent",
+                                   b"authorization", b"cookie"}
+                        next_request.headers = httpx.Headers([
+                            (key, value) for key, value in next_request.headers.raw
+                            if key.lower() in allowed
+                        ])
+                        next_request.headers["Host"] = next_request.url.netloc.decode("ascii")
+                    request = next_request
                     request.headers["Accept-Encoding"] = "gzip, deflate"
                     redirects += 1
                     continue
@@ -258,11 +369,13 @@ class Fetcher:
         Deliberately outside the get_json machinery: no caching, no
         retries, no circuit breaking, no rate floor — the target is the
         operator's own endpoint and delivery/failure semantics belong
-        to the caller. Raises whatever httpx raises.
+        to the caller. Never follows redirects, even with an injected client;
+        returns the original response. Raises whatever httpx raises.
         """
-        client = await self._get_client()
+        client = await self._get_post_client()
         return await client.post(
-            url, json=json, content=content, headers=headers, timeout=timeout
+            url, json=json, content=content, headers=headers, timeout=timeout,
+            follow_redirects=False,
         )
 
     async def get_json(
@@ -347,7 +460,10 @@ class Fetcher:
                 if self.vector_store:
                     await self.vector_store.store(source, data)
                 return data
-            except BodyLimitError as exc:
+            except PublicSourcePolicyError as exc:
+                last_error = exc
+                break
+            except (BodyLimitError, RedirectPolicyError) as exc:
                 last_error = exc
                 break
             except (httpx.HTTPStatusError, httpx.RequestError, Exception) as exc:
@@ -413,7 +529,10 @@ class Fetcher:
                 self.breaker.record_success(source)
                 self.cache.set(effective_key, text, cache_ttl)
                 return text
-            except BodyLimitError as exc:
+            except PublicSourcePolicyError as exc:
+                last_error = exc
+                break
+            except (BodyLimitError, RedirectPolicyError) as exc:
                 last_error = exc
                 break
             except (httpx.HTTPStatusError, httpx.RequestError, Exception) as exc:
@@ -484,6 +603,14 @@ class Fetcher:
                     body = await self._read_body(resp, max_bytes, max_encoded_bytes, processing_timeout)
                 self.breaker.record_success(source)
                 return BinaryResult(resp.status_code, body, None)
+            except PublicSourcePolicyError as exc:
+                last_status = None
+                last_error = safe_error(exc)
+                break
+            except RedirectPolicyError as exc:
+                last_status = None
+                last_error = safe_error(exc)
+                break
             except BodyLimitError as exc:
                 last_error = safe_error(exc)
                 break

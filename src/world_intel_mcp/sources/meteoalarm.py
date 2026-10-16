@@ -26,6 +26,7 @@ import re
 from datetime import datetime, timezone
 
 from ..fetcher import Fetcher
+from ..feed_parser import parse_feed_content
 
 try:
     import feedparser
@@ -184,7 +185,7 @@ async def fetch_meteoalarm_alerts(
             "timestamp": timestamp,
         }
 
-    parsed = feedparser.parse(xml_text)
+    parsed = parse_feed_content(xml_text)
 
     alerts = []
     by_severity: dict[str, int] = {}

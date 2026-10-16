@@ -439,7 +439,6 @@ class _CountingBasicAuth(httpx.BasicAuth):
 @pytest.mark.parametrize("target,retained", [
     ("https://other.test/final", False),
     ("https://upstream.test:8443/final", False),
-    ("http://upstream.test/final", False),  # HTTPS -> HTTP on the same host
     ("https://upstream.test/final", True),
 ])
 async def test_redirect_authorization_matches_httpx(fetcher, auth_mode, target, retained):
@@ -469,6 +468,209 @@ async def test_redirect_authorization_matches_httpx(fetcher, auth_mode, target, 
     assert streams[0].reads == 0 and all(s.closed for s in streams)
     if auth is not None:
         assert auth.calls == 1
+
+
+@pytest.mark.parametrize("owned", [False, True])
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+@pytest.mark.parametrize("payload", ["json", "content"])
+async def test_webhook_never_follows_redirects(fetcher, monkeypatch, owned, status, payload):
+    seen = []
+
+    def respond(request):
+        seen.append(request)
+        return httpx.Response(status, headers={"location": "https://elsewhere.test/sink",
+                                              "x-response": "original"}, content=b"original")
+
+    original_client = httpx.AsyncClient
+    if owned:
+        def make_client(**kwargs):
+            # This test exercises redirect/header handling, not destination policy.
+            kwargs["transport"] = httpx.MockTransport(respond)
+            return original_client(**kwargs)
+        monkeypatch.setattr("world_intel_mcp.fetcher.httpx.AsyncClient", make_client)
+    else:
+        fetcher._client = original_client(transport=httpx.MockTransport(respond), follow_redirects=True)
+    body = {"json": {"secret": "payload"}} if payload == "json" else {"content": b"raw payload"}
+    try:
+        response = await fetcher.post("http://localhost:9876/sink", **body,
+                                      headers={"X-Sink-Key": "dummy"}, timeout=7.25)
+        assert response.status_code == status
+        assert response.content == b"original" and response.headers["x-response"] == "original"
+        assert len(seen) == 1 and seen[0].method == "POST"
+        assert seen[0].headers["x-sink-key"] == "dummy"
+        assert seen[0].extensions["timeout"] == dict.fromkeys(["connect", "read", "write", "pool"], 7.25)
+        assert json.loads(seen[0].content) == body["json"] if payload == "json" else seen[0].content == body["content"]
+    finally:
+        await fetcher.close()
+
+
+@pytest.mark.parametrize("kind", ["json", "text", "xml", "bytes"])
+@pytest.mark.parametrize("owned", [False, True])
+@pytest.mark.parametrize("boundary", ["direct", "after-upgrade", "userinfo", "userinfo-relative", "empty-userinfo"])
+async def test_redirect_policy_terminal_unread_no_writes(fetcher, monkeypatch, caplog, kind, boundary, owned):
+    seen, streams, responses = [], [], []
+    start = "http://upstream.test/start" if boundary == "after-upgrade" else "https://upstream.test/start"
+    targets = {
+        "direct": ["http://upstream.test/private?token=hidden"],
+        "after-upgrade": ["https://upstream.test/second", "http://other.test/private?token=hidden"],
+        "userinfo": ["https://dummy-user:dummy-password@other.test/private?token=hidden"],
+        "userinfo-relative": ["//dummy-user:dummy-password@upstream.test/private"],
+        "empty-userinfo": ["https://@other.test/private"],
+    }[boundary]
+    stale = {"old": True} if kind == "json" else "old text"
+    fetcher.cache.set("redirect-stale", stale, ttl_seconds=-10)
+    before = fetcher.cache.get_stale_meta("redirect-stale")
+    fetcher.cache.set = Mock(wraps=fetcher.cache.set)
+    fetcher.vector_store = Mock(store=AsyncMock())
+    # _Chunks needs real cooperative sleeps for close. Record only backoff waits.
+    real_sleep = asyncio.sleep
+    waits = []
+    async def sleep(delay):
+        if delay:
+            waits.append(delay)
+        await real_sleep(0)
+    monkeypatch.setattr("world_intel_mcp.fetcher.asyncio.sleep", sleep)
+
+    def respond(request):
+        seen.append(request)
+        stream = _Chunks([b"must remain unread"])
+        streams.append(stream)
+        response = httpx.Response(302, headers={"location": targets[len(seen) - 1]}, stream=stream)
+        responses.append(response)
+        return response
+
+    original_client = httpx.AsyncClient
+    if owned:
+        def make_client(**kwargs):
+            # Destination pinning is covered with the real pool in integration tests.
+            kwargs["transport"] = httpx.MockTransport(respond)
+            return original_client(**kwargs)
+        monkeypatch.setattr("world_intel_mcp.fetcher.httpx.AsyncClient", make_client)
+    else:
+        fetcher._client = original_client(transport=httpx.MockTransport(respond), follow_redirects=True)
+    try:
+        kwargs = {} if kind == "bytes" else {"cache_key": "redirect-stale"}
+        result = await getattr(fetcher, f"get_{kind}")(start, "test-source", **kwargs)
+    finally:
+        await fetcher.close()
+    if kind == "bytes":
+        assert result.status is None and result.content is None and "forbidden" in result.error
+    elif kind == "json":
+        assert result["old"] and result["_stale"]
+    else:
+        assert result == stale
+    assert len(seen) == len(targets)
+    assert all(s.closed and s.reads == 0 for s in streams)
+    assert all(r.is_closed for r in responses)
+    assert not waits
+    assert fetcher.breaker.status()["test-source"]["total_failures"] == 1
+    assert fetcher.cache.get_stale_meta("redirect-stale") == before
+    fetcher.cache.set.assert_not_called()
+    fetcher.vector_store.store.assert_not_called()
+    assert "dummy-password" not in caplog.text and "hidden" not in caplog.text
+    assert "/start" not in caplog.text and "/private" not in caplog.text
+
+
+@pytest.mark.parametrize("target", ["https://other.test:8443/second", "https://upstream.test:8443/second",
+                                    "https://upstream.test:0/second"])
+async def test_cross_origin_strips_all_non_allowlisted_headers_permanently(fetcher, target):
+    seen = []
+    auth = _CountingBasicAuth()
+    client_headers = {"X-Client-Credential": "client-secret", "Proxy-Authorization": "proxy-secret",
+                      "Forwarded": "for=internal", "X-Forwarded-For": "internal", "Referer": "secret-referrer"}
+    call_headers = {"X-Arbitrary-Credential": "call-secret", "X-Api-Key": "api-secret",
+                    "Accept": "application/json", "User-Agent": "test-agent", "Host": "override.invalid",
+                    "Cookie": "manual=secret", "Accept-Encoding": "br"}
+
+    def respond(request):
+        seen.append(request)
+        locations = [target, "https://upstream.test/final"]
+        return httpx.Response(302, headers={"location": locations[len(seen) - 1]}, stream=_Chunks([])) if len(seen) <= 2 else httpx.Response(200, stream=_Chunks([b"ok"]))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond), follow_redirects=True,
+                                auth=auth, headers=client_headers) as client:
+        fetcher._client = client
+        assert await _fetch(fetcher, "text", headers=call_headers) == "ok"
+    assert all(key in seen[0].headers for key in client_headers | call_headers)
+    for request in seen[1:]:
+        assert set(request.headers) == {"accept", "accept-encoding", "user-agent", "host"}
+        assert request.headers["accept"] == "application/json"
+        assert request.headers["user-agent"] == "test-agent"
+        assert request.headers["host"] == request.url.netloc.decode("ascii")
+    assert all(r.headers["accept-encoding"] == "gzip, deflate" for r in seen)
+    assert auth.calls == 1
+
+
+@pytest.mark.parametrize("upgrade", [False, True])
+async def test_same_origin_headers_and_upgrade_auth_exception_with_cookie_jar(fetcher, upgrade):
+    seen = []
+    start = "http://upstream.test/start" if upgrade else "https://UPSTREAM.test:443/start"
+    target = "https://upstream.test/final"
+    def respond(request):
+        seen.append(request)
+        if len(seen) == 1:
+            return httpx.Response(302, headers={"location": target, "set-cookie": "fresh=jar; Path=/"}, stream=_Chunks([b"unread"]))
+        return httpx.Response(200, stream=_Chunks([b"ok"]))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond), follow_redirects=True,
+                                headers={"X-Client": "client", "Authorization": "Bearer dummy"}) as client:
+        client.cookies.set("stored", "cookie", domain="upstream.test", path="/")
+        fetcher._client = client
+        assert await fetcher.get_text(start, "test-source", headers={"X-Call": "call", "Cookie": "manual=secret", "Host": "override.invalid"}) == "ok"
+    assert seen[1].headers["authorization"] == "Bearer dummy"
+    assert seen[1].headers["cookie"] == "stored=cookie; fresh=jar"
+    assert seen[1].headers["host"] == ("upstream.test" if upgrade else "override.invalid")
+    assert seen[1].headers.get("x-client") == (None if upgrade else "client")
+    assert seen[1].headers.get("x-call") == (None if upgrade else "call")
+
+
+async def test_cross_origin_uses_only_httpx_destination_cookies_and_host(fetcher):
+    seen = []
+    def respond(request):
+        seen.append(request)
+        if len(seen) == 1:
+            return httpx.Response(302, headers={"location": "https://destination.test:8443/final",
+                                              "set-cookie": "source=fresh; Path=/"}, stream=_Chunks([]))
+        return httpx.Response(200, stream=_Chunks([b"ok"]))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond), follow_redirects=True) as client:
+        client.cookies.set("destination", "jar", domain="destination.test", path="/")
+        client.cookies.set("source", "jar", domain="upstream.test", path="/")
+        fetcher._client = client
+        assert await _fetch(fetcher, "text", headers={"Cookie": "manual=secret", "Host": "override.invalid"}) == "ok"
+    assert seen[0].headers["cookie"] == "manual=secret"
+    assert seen[1].headers["cookie"] == "destination=jar"
+    assert seen[1].headers["host"] == "destination.test:8443"
+
+
+@pytest.mark.parametrize("kind", ["json", "text", "xml", "bytes"])
+@pytest.mark.parametrize("encoding", ["gzip", "deflate"])
+@pytest.mark.parametrize("overflow", [False, True])
+async def test_allowed_cross_origin_redirects_keep_bounded_decoding(fetcher, kind, encoding, overflow):
+    seen, streams = [], []
+    body = b'{"ok":true}'
+    wire = gzip.compress(body) if encoding == "gzip" else zlib.compress(body)
+    def respond(request):
+        seen.append(request)
+        if len(seen) <= 2:
+            stream = _Chunks([b"unread redirect body"])
+            streams.append(stream)
+            return httpx.Response(302, headers={"location": "https://other.test/final"}, stream=stream)
+        stream = _Chunks([wire])
+        streams.append(stream)
+        return httpx.Response(200, headers={"content-encoding": encoding}, stream=stream)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond), follow_redirects=True,
+                                headers={"Accept-Encoding": "br, zstd"}) as client:
+        fetcher._client = client
+        result = await _fetch(fetcher, kind, max_bytes=len(body) - int(overflow))
+    if overflow:
+        assert (not result.ok) if kind == "bytes" else result is None
+        assert fetcher.breaker.status()["test-source"]["total_failures"] == 1
+        assert fetcher.cache.stats()["total_entries"] == 0
+    else:
+        assert result.content == body if kind == "bytes" else result == ({"ok": True} if kind == "json" else body.decode())
+    assert len(seen) == 3
+    assert all(s.closed for s in streams)
+    assert all(s.reads == 0 for s in streams[:2])
+    assert all(r.headers["accept-encoding"] == "gzip, deflate" for r in seen)
 
 
 async def test_credentials_do_not_reappear_later_in_redirect_chain(fetcher):

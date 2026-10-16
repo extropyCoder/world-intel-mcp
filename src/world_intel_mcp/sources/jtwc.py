@@ -28,6 +28,7 @@ import re
 from datetime import datetime, timezone
 
 from ..fetcher import Fetcher
+from ..feed_parser import parse_feed_content
 
 try:
     import feedparser
@@ -113,7 +114,7 @@ async def fetch_jtwc_cyclones(fetcher: Fetcher) -> dict:
             "timestamp": timestamp,
         }
 
-    parsed = feedparser.parse(xml_text)
+    parsed = parse_feed_content(xml_text)
 
     storms: list[dict] = []
     by_basin: dict[str, int] = {}

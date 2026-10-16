@@ -698,6 +698,54 @@ The vector store uses FastEmbed (ONNX-based, BAAI/bge-small-en-v1.5) for embeddi
 
 Everything else uses free, unauthenticated public APIs.
 
+### Fetcher proxy and CA environment trust
+
+Fetcher-owned HTTPX clients ignore proxy and CA environment settings by default
+(`trust_env=False`). This includes HTTP_PROXY/HTTPS_PROXY/ALL_PROXY, NO_PROXY
+(and supported lowercase proxy names), plus SSL_CERT_FILE/SSL_CERT_DIR. TLS
+verification stays enabled. Stock MCP, dashboard and collector entrypoints use
+this default; there is no new CLI flag or `WORLD_INTEL_TRUST_ENV` switch.
+
+Default owned **GETs** additionally use strict-direct public-address transport:
+all DNS answers are checked before dialing numeric IPs, private/special addresses
+are rejected (including redirect targets), and each new connection is revalidated.
+Original Host and HTTPS TLS identity are preserved. Operator **POSTs** use a
+separate unrestricted pool so intentional localhost webhooks still work; POSTs
+never follow redirects. Other separately constructed service/SDK clients are
+not covered. See [transport boundaries and limits](SECURITY.md#fetcher-get-profiles-and-public-address-transport).
+
+Python integrations can deliberately enable HTTPX environment trust, or configure
+an explicit CA context without enabling proxy/environment discovery:
+
+```python
+import ssl
+from world_intel_mcp.cache import Cache
+from world_intel_mcp.circuit_breaker import CircuitBreaker
+from world_intel_mcp.fetcher import Fetcher
+
+cache, breaker = Cache(), CircuitBreaker()
+# Trusted/non-strict GET mode: delegates routing to HTTPX/env proxies.
+# Opt in only when the environment and destinations are operator-trusted:
+fetcher = Fetcher(cache, breaker, trust_env=True)
+
+# Alternative: keep strict-public GETs and explicitly load a verifying CA:
+tls = ssl.create_default_context(cafile="/absolute/path/to/reviewed-ca-bundle.pem")
+fetcher_with_ca = Fetcher(cache, breaker, trust_env=False, verify=tls)
+```
+
+Use the configured Fetcher in your Python application/bootstrap; existing CLI
+launchers do not read an environment opt-in. `trust_env` requires an actual bool,
+and `verify` accepts only a bool or `SSLContext` (not a path string). Do not disable
+TLS verification to work around CA setup: strict GETs reject insecure contexts.
+`fetcher.get_transport_mode` reports `strict-public`, `trusted-environment`, or
+`trusted-injected`. An open injected `httpx.AsyncClient` retains its own proxy/CA/
+trust settings unchanged and is outside Fetcher's address guarantee. Opt-in
+`trust_env=True` likewise selects **non-strict** HTTPX routing; it does not silently
+bypass your proxies or add strict enforcement behind them. These are constructor
+choices, never tool/source/body-selected profiles. This is not full application
+SSRF protection; trusted profiles, operator POSTs and separate clients remain
+separate trust boundaries.
+
 ---
 
 ## Development

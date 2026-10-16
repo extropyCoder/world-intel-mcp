@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from html import unescape
 
 from ..fetcher import Fetcher
+from ..feed_parser import parse_feed_content
 
 try:
     import feedparser
@@ -84,7 +85,7 @@ async def fetch_volcano_activity(fetcher: Fetcher) -> dict:
             "timestamp": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
 
-    parsed = feedparser.parse(xml_text)
+    parsed = parse_feed_content(xml_text)
 
     volcanoes = []
     new_count = 0

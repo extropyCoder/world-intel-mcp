@@ -12,6 +12,7 @@ import string
 from datetime import datetime, timezone
 
 from ..fetcher import Fetcher
+from ..feed_parser import parse_feed_content
 from ..diagnostics import safe_url
 
 try:
@@ -592,7 +593,7 @@ async def fetch_news_feed(
             logger.debug("No data from RSS feed %s (%s)", feed_name, safe_url(url))
             return []
 
-        parsed = feedparser.parse(xml_text)
+        parsed = parse_feed_content(xml_text)
         items: list[dict] = []
 
         for entry in parsed.get("entries", []):
