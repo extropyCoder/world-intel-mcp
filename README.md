@@ -189,11 +189,38 @@ Options (no extra setup commands required):
 - Select an **already installed executable**, not a shell command, with
   `SMOKE_PYTHON=/path/to/python3.12 ./scripts/smoke-test.sh`.
 
-Prerequisites: remote Linux with readable `/proc`, Bash, Python **>=3.11** with
-`venv`/`ensurepip`, sufficient temporary disk space, and access to public PyPI and
-the selected APIs; local Bash, OpenSSH client and browser, plus SSH access to the
-remote machine. No curl, desktop browser or GUI is needed remotely. Missing OS
-venv packages/wheels are reported; the scripts never sudo or install OS packages.
+Prerequisites: remote Linux with readable `/proc`, Bash, an installed Python
+**>=3.11**, sufficient temporary disk space, and access to public PyPI and the
+selected APIs; local Bash, OpenSSH client and browser, plus SSH access to the
+remote machine. No curl, desktop browser or GUI is needed remotely.
+
+**Missing `ensurepip`/venv on Debian or Ubuntu:** rerun the same smoke script in
+your terminal. Before creating app state, it checks the **selected interpreter**
+with `-I`, then offers a **default-NO** prompt for its exact OS venv package (for
+Python 3.14, `python3.14-venv`). Answer `yes` to let the script perform that step;
+sudo may ask for your password. **Do not run the repository script with sudo.**
+Only a root-owned system `apt-get` executable is elevated, with fixed argument
+arrays; root users must confirm too. Help, noninteractive runs, blank answers
+and declined prompts never install anything.
+
+After confirmation, the script reads the existing APT candidate and simulates
+the plan before installing. It allows only the matching venv package and missing
+pip/setuptools/wheel archives; interpreter installation, unrelated packages,
+upgrades and removals are refused. It does **not** refresh APT indexes, add a
+repository/PPA, install Python, or run pip/repository code as root. If the exact
+package has no candidate, sudo is unavailable, or the plan is outside that scope,
+it stops with an actionable explanation. Administrators must resolve those cases;
+the script does not expand its privileges or installation scope automatically.
+The selected interpreter is rechecked after installation and is never silently
+switched. Ctrl+C forwards an interrupt and waits for APT to finish/stop, rather
+than orphaning or force-killing a privileged package transaction.
+
+Python **3.14 is not fully end-to-end smoke-tested here**. Installing its venv
+support does not guarantee availability of all third-party binary wheels. If a
+later wheel/install step is blocked, explicitly select an already installed
+supported interpreter, e.g. `SMOKE_PYTHON=/path/to/python3.12`; no older Python is
+auto-selected and no alternate interpreter is installed for you.
+
 Setup stages have finite deadlines (venv 120s, wheel install 600s, selected tests
 180s, stronger checks 90s with a 60s async budget); readiness is bounded to 30s
 with individually bounded probes. The existing tests retain their bounded
@@ -202,7 +229,8 @@ current allowed dependency ranges, not a locked/reproducible deployment. Child
 cleanup allows up to five seconds of graceful shutdown before killing its owned
 process group; it does not terminate unrelated listeners or services.
 
-Isolation/limits: no existing venv or user packages are changed. Private state
+Isolation/limits: apart from the explicitly approved OS prerequisite step above,
+no existing venv or user packages are changed. Private state
 uses a fresh UID-owned 0700 directory, checked for unsafe ancestors/symlinks;
 `WORLD_INTEL_CACHE_DB`, HOME, pip configuration and caches all point into it.
 Production AOIs/caches, inherited API keys, proxy/CA settings and webhook variables

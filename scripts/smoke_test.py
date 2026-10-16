@@ -17,6 +17,7 @@ import json
 import math
 import os
 from pathlib import Path
+import platform
 import re
 import signal
 import stat
@@ -40,6 +41,147 @@ def port(value):
     if not re.fullmatch(r"[0-9]{1,5}", str(value)) or not 1 <= int(value) <= 65535:
         raise argparse.ArgumentTypeError("port must be an integer from 1 to 65535")
     return int(value)
+
+
+def system_environment():
+    """Do not pass repository/Python/loader/APT overrides into system tools."""
+    return {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "LC_ALL": "C", "TERM": "dumb"}
+
+
+def venv_prerequisites_ready():
+    # Check the *same* selected interpreter in isolated mode, without invoking
+    # ensurepip.bootstrap() or modifying its installed packages.
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", "import venv, ensurepip; ensurepip.version()"],
+        cwd="/", env=system_environment(), stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, timeout=15,
+    )
+    return result.returncode == 0
+
+
+def venv_package_name():
+    major, minor = sys.version_info[:2]
+    if type(major) is not int or type(minor) is not int or major < 3 or minor < 0:
+        raise SmokeError("Invalid selected Python version")
+    return f"python{major}.{minor}-venv"
+
+
+def debian_family():
+    try:
+        release = platform.freedesktop_os_release()
+    except OSError:
+        return False
+    return bool(({release.get("ID", "")} | set(release.get("ID_LIKE", "").split())) & {"debian", "ubuntu"})
+
+
+def trusted_system_tool(name):
+    if name not in ("apt-get", "apt-cache", "sudo"):
+        raise SmokeError("Unsupported system prerequisite tool")
+    candidate = Path("/usr/bin") / name
+    try:
+        resolved = candidate.resolve(strict=True)
+        for directory in resolved.parents:
+            info = directory.stat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+                raise SmokeError(f"Untrusted system executable directory for {name}")
+        info = resolved.stat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0
+                or info.st_mode & 0o022 or not os.access(resolved, os.X_OK)):
+            raise SmokeError(f"Untrusted system executable: {name}")
+    except OSError as exc:
+        raise SmokeError(f"Required system executable /usr/bin/{name} is unavailable") from exc
+    return str(resolved)
+
+
+def query_system_tool(command):
+    result = subprocess.run(command, cwd="/", env=system_environment(),
+                            capture_output=True, text=True, timeout=15)
+    if result.returncode:
+        raise SmokeError("APT prerequisite inspection failed; no package install was attempted")
+    return result.stdout
+
+
+def validate_venv_plan(plan, package):
+    # Never install/upgrade an interpreter as a side effect, nor upgrade/remove
+    # other packages. Allow only the venv package and missing wheel archives it
+    # may need. APT's already-configured repositories remain operator-trusted.
+    allowed = {package, "python3-pip-whl", "python3-setuptools-whl", "python3-wheel-whl"}
+    for line in plan.splitlines():
+        if line.startswith(("Remv ", "Purg ")):
+            raise SmokeError("APT proposes removals; refusing automatic prerequisite installation")
+        if line.startswith(("Inst ", "Conf ")):
+            parts = line.split()
+            if len(parts) < 2 or parts[1] not in allowed:
+                raise SmokeError("APT proposes unrelated packages or Python interpreter changes; ask an administrator")
+            if line.startswith("Inst ") and "[" in line.split("(", 1)[0]:
+                raise SmokeError("APT proposes a package upgrade; refusing automatic upgrades")
+
+
+def install_system_package(command):
+    # Keep the terminal/session for sudo authentication and normal APT SIGINT
+    # handling. Never elevate a repository script, shell, pip or env wrapper.
+    process = subprocess.Popen(command, cwd="/", env=system_environment(), umask=0o022)
+    try:
+        code = process.wait()
+    except BaseException:
+        previous = {sig: signal.signal(sig, signal.SIG_IGN) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+        try:
+            if process.poll() is None:
+                try:
+                    process.send_signal(signal.SIGINT)
+                except (ProcessLookupError, PermissionError):
+                    pass  # sudo/terminal may already have forwarded the signal.
+            # Do not orphan a privileged transaction or force-kill dpkg midway.
+            process.wait()
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
+        raise
+    if code:
+        raise SmokeError(f"System venv package installation failed (exit {code}); no smoke state was started")
+
+
+def ensure_system_venv():
+    print(f"Selected Python {sys.version_info.major}.{sys.version_info.minor}: {sys.executable}; checking venv/ensurepip with -I.", flush=True)
+    if sys.version_info >= (3, 14):
+        print("Python 3.14+ is not fully end-to-end smoke-tested here; venv support does not guarantee all dependency wheels. If installation is later blocked, explicitly set SMOKE_PYTHON=/path/to/an/already-installed/python3.12; no interpreter is auto-selected.", flush=True)
+    if venv_prerequisites_ready():
+        print("PASS: selected interpreter provides venv/ensurepip.", flush=True)
+        return
+    package = venv_package_name()
+    manual = f"Required OS package: {package}. An administrator can use apt-get install -- {package} if available."
+    print("Selected interpreter's venv/ensurepip is unavailable.", flush=True)
+    if not debian_family():
+        raise SmokeError("Automatic OS prerequisite setup is supported only on Debian/Ubuntu. " + manual)
+    if not sys.stdin.isatty():
+        raise SmokeError("Noninteractive run: no OS packages installed. Rerun in a terminal for the default-NO prompt. " + manual)
+    print(f"Can install only {package} and any missing pip/setuptools/wheel archives it requires.", flush=True)
+    print("APT may contact configured repositories, but no Python installation/upgrades, index update, repositories or PPAs will be added. sudo may request your password.", flush=True)
+    print("This may repair only distro Python; the selected interpreter will be rechecked, never switched.", flush=True)
+    try:
+        answer = input(f"Install the system venv prerequisite {package}? [y/N] ")
+    except EOFError:
+        answer = ""
+    if answer.strip().lower() not in ("y", "yes"):
+        raise SmokeError("Prerequisite installation declined; no OS packages installed. " + manual)
+    apt = trusted_system_tool("apt-get")
+    apt_cache = trusted_system_tool("apt-cache")
+    sudo = None if os.geteuid() == 0 else trusted_system_tool("sudo")
+    policy = query_system_tool([apt_cache, "policy", package])
+    candidate = re.search(r"^\s*Candidate:\s*(\S+)\s*$", policy, re.M)
+    if candidate is None or candidate.group(1) == "(none)":
+        raise SmokeError(f"No APT candidate for {package} in the configured indexes. No install/update/repository changes attempted. Ask an administrator or explicitly select another installed Python via SMOKE_PYTHON.")
+    flags = ["install", "--no-install-recommends", "--no-upgrade", "--no-remove"]
+    plan = query_system_tool([apt, "--simulate", *flags, "--", package])
+    validate_venv_plan(plan, package)
+    command = [apt, *flags, "-y", "--", package]
+    if sudo is not None:
+        command = [sudo, "--", *command]
+    print(f"Installing approved prerequisite {package}; waiting for the system package manager to finish.", flush=True)
+    install_system_package(command)
+    if not venv_prerequisites_ready():
+        raise SmokeError(f"{package} installation completed but the selected interpreter still lacks venv/ensurepip. No smoke state started and Python was not switched. For a custom or wheel-incompatible Python 3.14, explicitly choose an existing supported interpreter (for example SMOKE_PYTHON=/path/to/python3.12).")
+    print("PASS: selected interpreter now provides venv/ensurepip; continuing isolated setup.", flush=True)
 
 
 def check_directory(path, *, private=False):
@@ -427,14 +569,13 @@ def main(argv=None):
         return 0
     if sys.platform != "linux" or not Path("/proc/self/fd").is_dir():
         raise SmokeError("Run this headless runner on Linux with readable /proc; use smoke-tunnel.sh on the local browser machine")
-    if importlib.util.find_spec("venv") is None:
-        raise SmokeError("Python venv support is missing; install your OS's Python venv package (no sudo/OS installs are performed)")
-    os.umask(0o077)
-    check_free_port(args.port)
     def interrupted(*_):
         raise KeyboardInterrupt()
     for sig in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, interrupted)
+    check_free_port(args.port)
+    ensure_system_venv()
+    os.umask(0o077)
     print("LIVE NETWORK RUN: installs public PyPI wheels + this project; runs only earthquake, forex, service-status smoke tests.", flush=True)
     print("Fresh disposable venv/cache; no inherited credentials/.env; no collector/history/model installation. Browser use loads more public dashboard sources.", flush=True)
     check_directory(Path("/tmp"))
@@ -467,6 +608,9 @@ def main(argv=None):
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("Stopped before smoke setup; no dashboard started.", file=sys.stderr)
+        raise SystemExit(130)
     except (SmokeError, OSError, ValueError, KeyError, TimeoutError) as exc:
         print(f"Smoke failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         raise SystemExit(1)

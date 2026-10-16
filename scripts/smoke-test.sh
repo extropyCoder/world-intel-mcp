@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # Run on the headless dashboard machine. All state is disposable and private.
+# Missing Debian/Ubuntu venv support is offered interactively, default NO.
+# Never run this repository script with sudo; only the approved system apt-get
+# command is elevated by the helper when necessary.
 set -euo pipefail
 umask 077
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
