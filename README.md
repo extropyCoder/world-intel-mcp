@@ -138,6 +138,93 @@ oversized bodies 413, unavailable vector storage 503, and internal search
 failures a generic 500. Validation happens before request-time initialization.
 These limits apply to the dashboard endpoint, not the MCP vector-search API.
 
+### Headless smoke run + local browser (scripted)
+
+**On the remote/headless Linux machine**, from this checkout:
+
+```bash
+./scripts/smoke-test.sh
+```
+
+This explicitly performs **live public-network checks and PyPI installation**.
+It creates a new private temporary venv/state directory on every run, installs
+only this project's `dashboard,dev` extras (plus a dotenv version supporting
+disable mode), then runs just the existing earthquake, forex and service-status
+smoke tests. Additional checks require fresh non-stale/error-free data, plausible
+earthquake/rate fields and valid status feeds from every configured provider.
+Quiet status feeds may have zero incidents; unavailable feeds fail the run.
+No credentials are needed. An upstream outage is a nonzero failure, not a pass
+with empty/stale data. No other live smoke tests are selected.
+
+The script starts a background dashboard on **127.0.0.1:8501 only**, verifies the
+actual child PID's Linux `/proc` listener, health/root responses, hostile Host
+400, hostile Origin 403, same-origin 200, and absence of wildcard CORS. It then
+prints PID, private log path, RSS and cumulative CPU time (not resource limits),
+and stays in the foreground. **Keep that terminal open. Ctrl+C stops its child
+processes and removes its private venv/cache/logs** (normal interrupt exit 130).
+It never kills an existing listener; choose another port if 8501 is occupied.
+
+**On your local browser machine**, use a checkout or copy of the standalone
+tunnel helper:
+
+```bash
+./scripts/smoke-tunnel.sh
+```
+
+Answer its SSH `user@host`/host-alias, remote-port (8501), and local-port (18501)
+prompts. Complete normal SSH authentication/host-key verification, then open the
+printed **http://127.0.0.1:18501/** URL. Ctrl+C closes the local tunnel; stop the
+remote script separately. A headless server cannot initiate a local browser's
+SSH forwarding session for you: these are two invocations on two machines.
+No public bind or automatic host-key acceptance is used. IPv6 SSH destinations
+can be configured behind a trusted SSH host alias; the helper accepts plain
+hostnames, IPv4 addresses and aliases, not SSH URLs or embedded options.
+
+Options (no extra setup commands required):
+
+- Remote: `./scripts/smoke-test.sh --checks-only` runs the same live checks,
+  stops the dashboard and cleans up immediately; success exits 0.
+- Remote: `./scripts/smoke-test.sh --port 8502` uses another loopback port.
+- Local: `./scripts/smoke-tunnel.sh user@host --remote-port 8502 --local-port 18502`.
+- Select an **already installed executable**, not a shell command, with
+  `SMOKE_PYTHON=/path/to/python3.12 ./scripts/smoke-test.sh`.
+
+Prerequisites: remote Linux with readable `/proc`, Bash, Python **>=3.11** with
+`venv`/`ensurepip`, sufficient temporary disk space, and access to public PyPI and
+the selected APIs; local Bash, OpenSSH client and browser, plus SSH access to the
+remote machine. No curl, desktop browser or GUI is needed remotely. Missing OS
+venv packages/wheels are reported; the scripts never sudo or install OS packages.
+Setup stages have finite deadlines (venv 120s, wheel install 600s, selected tests
+180s, stronger checks 90s with a 60s async budget); readiness is bounded to 30s
+with individually bounded probes. The existing tests retain their bounded
+Fetcher retries; stronger source checks make one attempt. Installation resolves
+current allowed dependency ranges, not a locked/reproducible deployment. Child
+cleanup allows up to five seconds of graceful shutdown before killing its owned
+process group; it does not terminate unrelated listeners or services.
+
+Isolation/limits: no existing venv or user packages are changed. Private state
+uses a fresh UID-owned 0700 directory, checked for unsafe ancestors/symlinks;
+`WORLD_INTEL_CACHE_DB`, HOME, pip configuration and caches all point into it.
+Production AOIs/caches, inherited API keys, proxy/CA settings and webhook variables
+are not reused. `PYTHON_DOTENV_DISABLED=1` is **tested before app import**, so a
+repository `.env` cannot inject production settings. Logs are private and failure
+tails receive best-effort URL/credential-label redaction, not universal free-text
+secret detection. Temporary state is removed on failure/exit as well as success.
+This is process/configuration isolation, not an OS sandbox: use a trusted checkout,
+Python executable and package registry. SSH hangup/termination also triggers child
+cleanup; abrupt SIGKILL, kernel/host failure or power loss cannot run cleanup.
+
+No collector, historical baseline tool, Qdrant service, PDF/vector SDK or model
+package is installed or launched. The existing `OLLAMA_API_URL` setting is set
+to an intentionally unsupported scheme, forcing the app's existing brief fallback
+without contacting an already running Ollama server. This is not a new app-wide
+feature toggle: the dashboard can still initialize its optional vector worker,
+but without its SDK/model dependencies it cannot populate vector storage. Opening
+the browser starts the dashboard's normal broader public-source requests and
+external assets/map tiles; the initial three-source check is not full UI coverage.
+Local SSH configuration is operator-trusted. These scripts do not expose a remote
+browser, modify firewall/SSH-server settings, or establish production readiness.
+
 ### PDF/HTML Reports
 
 ```bash
