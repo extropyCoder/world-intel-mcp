@@ -53,7 +53,6 @@ from world_intel_mcp.sources import (
     nuclear,
     service_status,
     traffic,
-    webcams,
     migration,
 )
 from world_intel_mcp.analysis.alerts import fetch_alert_digest, fetch_weekly_trends
@@ -268,7 +267,6 @@ async def _fetch_overview() -> dict:
         "ucdp_events": conflict.fetch_ucdp_events(fetcher),
         "displacement": displacement.fetch_displacement_summary(fetcher),
         "risk_scores": intelligence.fetch_risk_scores(fetcher),
-        "signal_convergence": intelligence.fetch_signal_convergence(fetcher),
         "space_weather": space_weather.fetch_space_weather(fetcher),
         "ai_watch": ai_watch.fetch_ai_watch(fetcher),
         "disease_outbreaks": health.fetch_disease_outbreaks(fetcher),
@@ -286,7 +284,6 @@ async def _fetch_overview() -> dict:
         "domestic_flights": aviation.fetch_domestic_flights(fetcher),
         "traffic_flow": traffic.fetch_traffic_flow(fetcher),
         "traffic_incidents": traffic.fetch_traffic_incidents(fetcher),
-        "webcams": webcams.fetch_webcams(fetcher),
         "btc_technicals": markets.fetch_btc_technicals(fetcher),
         "central_bank_rates": fetch_central_bank_rates(fetcher),
     }
@@ -448,9 +445,6 @@ def _stream_source_defs(fetcher: Fetcher) -> dict:
             fetcher
         ),
         "risk_scores": lambda: intelligence.fetch_risk_scores(fetcher),
-        "signal_convergence": lambda: intelligence.fetch_signal_convergence(
-            fetcher
-        ),
         "space_weather": lambda: space_weather.fetch_space_weather(fetcher),
         "ai_watch": lambda: ai_watch.fetch_ai_watch(fetcher),
         "disease_outbreaks": lambda: health.fetch_disease_outbreaks(
@@ -478,7 +472,6 @@ def _stream_source_defs(fetcher: Fetcher) -> dict:
         "traffic_incidents": lambda: traffic.fetch_traffic_incidents(
             fetcher
         ),
-        "webcams": lambda: webcams.fetch_webcams(fetcher),
         "btc_technicals": lambda: markets.fetch_btc_technicals(fetcher),
         "central_bank_rates": lambda: fetch_central_bank_rates(fetcher),
     }

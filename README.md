@@ -271,7 +271,37 @@ intel report -o brief.pdf    # custom output path
 intel report -s markets,cyber,earthquakes  # select sections
 ```
 
-Map-first ops center: Leaflet map with toggle-able layers (quakes, military, conflict, fires, convergence, nuclear, infrastructure, your AOI geofences with last-sweep counts, UNHCR migration corridors between capitals), 47 live SSE feeds, HUD bar, glassmorphic panels, per-source circuit breaker health.
+Map-first ops center: Leaflet map with toggle-able layers (quakes, military,
+conflict, fires, nuclear, infrastructure, population exposure and your AOI
+geofences with last-sweep counts), 45 automatic SSE source slots, HUD bar,
+glassmorphic panels and per-source circuit breaker health. These sources have
+different reporting cadences; an SSE update does not mean every datum is live.
+
+Webcams, migration-flow overlays and signal convergence are no longer displayed
+or automatically fetched by the dashboard. Their MCP/source APIs and the manual
+`/api/migration` endpoint remain available. No historical-baseline fetch was added.
+UNHCR annual summary data is retained separately from migration-flow overlays.
+
+The header wraps and scrolls within the viewport rather than clipping counters.
+Side panels are width-bounded, tables wrap long values, and the Vector Intelligence
+panel now lives inside the scrollable data drawer instead of adding another fixed
+column. On small screens, use **Layers** to expand the scrollable feed toggles.
+The OpenStreetMap copyright link stays above the drawer/ticker stack.
+
+HUD buttons marked **↗** show a map layer; **▤** opens supporting details.
+**Threat indicators** opens the Cyber drawer section and counts reported indicators
+of compromise, not attacks. Summary-only counters are non-button text with
+explanatory tooltips. **UNHCR + year** is the annual people-of-concern grand total
+(refugees, asylum seekers, IDPs, stateless persons and others of concern), not a
+live displaced-person count. **Exposed** is a rough sum of city populations within
+200 km of hazards, not actual victims or confirmed affected people.
+
+Alert-banner rows are buttons opening a detail panel using already-provided
+evidence, without another request: military estimated counts/baselines/ratios
+(the digest includes at most three surge records), or all supplied cable-corridor
+names with matched navigation warnings when available. Cable status is explicitly
+a warning-based heuristic, **not confirmed damage/outage**, even when its source
+label is `disrupted`. Missing evidence and unknown/stale freshness are identified.
 
 ### CLI
 
