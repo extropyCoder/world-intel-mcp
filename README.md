@@ -105,6 +105,14 @@ Add to `~/.claude.json`:
 
 ### Dashboard
 
+The light basemap uses standard OpenStreetMap tiles, with visible contributor
+attribution and no API key. Use the public tile service for light interactive
+viewing in accordance with its [tile usage policy](https://operations.osmfoundation.org/policies/tiles/),
+not bulk downloading or prefetching. Browsers request tiles directly, so the
+provider sees the browser client's IP address, even when the dashboard is reached
+through an SSH tunnel. Availability and usage/rate policies apply; the public
+service is not a production SLA.
+
 ```bash
 intel-dashboard              # http://localhost:8501
 intel-dashboard --port 9000  # custom port
