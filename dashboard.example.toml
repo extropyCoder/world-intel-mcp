@@ -1,0 +1,26 @@
+# Version 1: focused, dashboard-only, no credentials or fetch destinations.
+version = 1
+groups = ["markets", "cyber", "military"]
+refresh_seconds = 60
+port = 8501
+# Optional sources = [...] restricts the trusted source list further.
+
+[map]
+center = [20, 0]
+zoom = 2.5
+static = true
+aois = false
+
+[ui]
+sections = ["markets", "cyber", "military"]
+counters = ["markets", "cyber", "military"]
+
+[alerts]
+categories = ["cable", "cyber"]
+cable_score = 2
+cyber_critical = 1
+
+[services]
+vector = false
+ollama = false
+history = false

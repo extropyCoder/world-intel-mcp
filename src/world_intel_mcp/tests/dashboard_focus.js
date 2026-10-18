@@ -33,7 +33,9 @@ Object.defineProperty(Element.prototype, 'textContent', {
     set: function(text) { this.replaceChildren(); this._text = String(text); }
 });
 Object.defineProperty(Element.prototype, 'innerHTML', {
+    get: function() { return this._text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); },
     set: function(html) {
+        this.renderedHTML = html;
         this.replaceChildren();
         // Parse just the real renderer's section headings and adjoining content.
         // Preserve order/sibling traversal for its actual collapse-restore loop.

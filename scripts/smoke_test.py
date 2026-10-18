@@ -141,10 +141,10 @@ def install_system_package(command):
         raise SmokeError(f"System venv package installation failed (exit {code}); no smoke state was started")
 
 
-def ensure_system_venv():
+def ensure_system_venv(python_selector="SMOKE_PYTHON"):
     print(f"Selected Python {sys.version_info.major}.{sys.version_info.minor}: {sys.executable}; checking venv/ensurepip with -I.", flush=True)
     if sys.version_info >= (3, 14):
-        print("Python 3.14+ is not fully end-to-end smoke-tested here; venv support does not guarantee all dependency wheels. If installation is later blocked, explicitly set SMOKE_PYTHON=/path/to/an/already-installed/python3.12; no interpreter is auto-selected.", flush=True)
+        print(f"Python 3.14+ is not fully end-to-end smoke-tested here; venv support does not guarantee all dependency wheels. If installation is later blocked, explicitly set {python_selector}=/path/to/an/already-installed/python3.12; no interpreter is auto-selected.", flush=True)
     if venv_prerequisites_ready():
         print("PASS: selected interpreter provides venv/ensurepip.", flush=True)
         return
@@ -170,7 +170,7 @@ def ensure_system_venv():
     policy = query_system_tool([apt_cache, "policy", package])
     candidate = re.search(r"^\s*Candidate:\s*(\S+)\s*$", policy, re.M)
     if candidate is None or candidate.group(1) == "(none)":
-        raise SmokeError(f"No APT candidate for {package} in the configured indexes. No install/update/repository changes attempted. Ask an administrator or explicitly select another installed Python via SMOKE_PYTHON.")
+        raise SmokeError(f"No APT candidate for {package} in the configured indexes. No install/update/repository changes attempted. Ask an administrator or explicitly select another installed Python via {python_selector}.")
     flags = ["install", "--no-install-recommends", "--no-upgrade", "--no-remove"]
     plan = query_system_tool([apt, "--simulate", *flags, "--", package])
     validate_venv_plan(plan, package)
@@ -180,7 +180,7 @@ def ensure_system_venv():
     print(f"Installing approved prerequisite {package}; waiting for the system package manager to finish.", flush=True)
     install_system_package(command)
     if not venv_prerequisites_ready():
-        raise SmokeError(f"{package} installation completed but the selected interpreter still lacks venv/ensurepip. No smoke state started and Python was not switched. For a custom or wheel-incompatible Python 3.14, explicitly choose an existing supported interpreter (for example SMOKE_PYTHON=/path/to/python3.12).")
+        raise SmokeError(f"{package} installation completed but the selected interpreter still lacks venv/ensurepip. No smoke state started and Python was not switched. For a custom or wheel-incompatible Python 3.14, explicitly choose an existing supported interpreter (for example {python_selector}=/path/to/python3.12).")
     print("PASS: selected interpreter now provides venv/ensurepip; continuing isolated setup.", flush=True)
 
 

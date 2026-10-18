@@ -820,6 +820,22 @@ button.stat-pill:focus-visible { outline: 2px solid var(--accent); outline-offse
 
 var $ = function(s) { return document.querySelector(s); };
 var $$ = function(s) { return document.querySelectorAll(s); };
+var dashboardProfile = null; // Server replaces only this literal with public metadata.
+function profileData(data, purpose) {
+    if (typeof dashboardProfile === 'undefined' || !dashboardProfile) return data;
+    var allowed = [];
+    (dashboardProfile[purpose] || dashboardProfile.groups).forEach(function(group) {
+        allowed = allowed.concat(dashboardProfile.group_sources[group] || []);
+    });
+    var selected = {};
+    allowed.forEach(function(key) {
+        if (data[key] == null) return;
+        var value = data[key];
+        selected[key] = purpose === 'counters' && (!value._coverage || value._coverage.state !== 'current')
+            ? {error: 'Request coverage is not current'} : value;
+    });
+    return selected;
+}
 // Keep panels below the actual wrapped header, including after live HUD updates.
 function fitHeader() {
     document.documentElement.style.setProperty('--layers-top', Math.ceil($('#topBar').getBoundingClientRect().bottom + 10) + 'px');
@@ -852,6 +868,11 @@ var latestVectorData = null;
 var DASHBOARD_CACHE_KEY = 'phoenix-dashboard-cache-v1';
 var STATIC_CACHE_KEY = 'phoenix-static-cache-v1';
 var VECTOR_CACHE_KEY = 'phoenix-vector-cache-v1';
+if (dashboardProfile) {
+    DASHBOARD_CACHE_KEY += '-focused-v2-' + dashboardProfile.cache_key;
+    STATIC_CACHE_KEY += '-focused-v2-' + dashboardProfile.cache_key;
+    VECTOR_CACHE_KEY += '-focused-v2-' + dashboardProfile.cache_key;
+}
 var INFRA_SNAPSHOT_KEYS = ['military_bases', 'strategic_ports', 'pipelines', 'nuclear_facilities', 'trade_routes', 'waterways', 'cable_corridors'];
 function _readCacheEnvelope(key) {
     try {
@@ -869,9 +890,16 @@ function _extractCachePayload(entry) {
 function _mergeStaticData(data) {
     if (!data) return data;
     var merged = Object.assign({}, data);
+    if (typeof dashboardProfile !== 'undefined' && dashboardProfile) {
+        var keep = dashboardProfile.sources.concat(['timestamp']);
+        if (dashboardProfile.alerts) keep.push('alert_digest');
+        if (dashboardProfile.static_map) keep = keep.concat(INFRA_SNAPSHOT_KEYS);
+        Object.keys(merged).forEach(function(key) { if (keep.indexOf(key) < 0) delete merged[key]; });
+    }
     // Old browser snapshots/SSE servers must not restore retired dashboard feeds.
     ['webcams', 'migration', 'signal_convergence'].forEach(function(key) { delete merged[key]; });
     INFRA_SNAPSHOT_KEYS.forEach(function(key) {
+        if (typeof dashboardProfile !== 'undefined' && dashboardProfile && !dashboardProfile.static_map) return;
         if (merged[key] == null && latestStaticData && latestStaticData[key] != null) merged[key] = latestStaticData[key];
     });
     return merged;
@@ -900,6 +928,7 @@ function _restoreCachedDashboard() {
     }
 }
 function _restoreCachedVector() {
+    if (dashboardProfile && !dashboardProfile.vector) return false;
     var cachedVector = _extractCachePayload(_readCacheEnvelope(VECTOR_CACHE_KEY));
     if (!cachedVector) return false;
     try {
@@ -914,7 +943,7 @@ function _restoreCachedVector() {
 // ════════════ MAP INIT ════════════
 function initMap() {
     // Attribution is the static body-level #map-attribution, above drawer stacks.
-    map = L.map('map', { zoomControl: false, attributionControl: false, worldCopyJump: true }).setView([20, 0], 2.5);
+    map = L.map('map', { zoomControl: false, attributionControl: false, worldCopyJump: true }).setView(dashboardProfile ? dashboardProfile.center : [20, 0], dashboardProfile ? dashboardProfile.zoom : 2.5);
     L.control.zoom({ position: 'bottomleft' }).addTo(map);
     L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
         maxNativeZoom: 19, maxZoom: 19
@@ -1539,6 +1568,7 @@ function _toggleHelp() {
 var _layerKeys = ['quakes','military','conflict','fires','nuclear','infra','exposure','airtraffic','news','aoi'];
 function _toggleLayerByIndex(idx) {
     var key = _layerKeys[idx];
+    if (dashboardProfile && dashboardProfile.layers.indexOf(key) < 0) return;
     if (!key || !mapLayers[key]) return;
     var row = document.querySelector('.layer-row[data-layer="' + key + '"]');
     if (!row) return;
@@ -1555,6 +1585,7 @@ var _allLayersOn = true;
 function _toggleAllLayers() {
     _allLayersOn = !_allLayersOn;
     _layerKeys.forEach(function(key) {
+        if (dashboardProfile && dashboardProfile.layers.indexOf(key) < 0) return;
         if (!mapLayers[key]) return;
         layerState[key] = _allLayersOn;
         if (_allLayersOn) { mapLayers[key].addTo(map); }
@@ -1590,7 +1621,7 @@ document.addEventListener('keydown', function(e) {
         toggleLayerPanel();
         return;
     }
-    if (e.key === 'r') { map.setView([20, 0], 2.5); return; }
+    if (e.key === 'r') { map.setView(dashboardProfile ? dashboardProfile.center : [20, 0], dashboardProfile ? dashboardProfile.zoom : 2.5); return; }
     if (e.key === '=' || e.key === '+') { map.zoomIn(); return; }
     if (e.key === '-') { map.zoomOut(); return; }
     if (e.key === 'f') {
@@ -2070,6 +2101,10 @@ function updateAlertBanner(data) {
     el.replaceChildren();
     _bannerAlerts = [];
     _bannerDigest = data;
+    if (typeof dashboardProfile !== 'undefined' && dashboardProfile && !dashboardProfile.alerts) {
+        el.classList.remove('show');
+        return;
+    }
     if (!data || data.error || data._stale || data.degraded) {
         el.classList.add('show');
         el.textContent = 'Alert digest unavailable or stale; current alerts cannot be confirmed.';
@@ -2180,6 +2215,7 @@ function showAlertDetail(index) {
 // ════════════ TOP BAR STATS ════════════
 
 function updateHudStats(data) {
+    if (typeof dashboardProfile !== 'undefined' && dashboardProfile) data = profileData(data, 'counters');
     var hud = $('#hudStats');
     var restoreFocus = rememberControlFocus(hud);
     hud.replaceChildren();
@@ -2201,6 +2237,13 @@ function updateHudStats(data) {
         });
         hud.appendChild(el);
     }
+    if (typeof dashboardProfile !== 'undefined' && dashboardProfile && data.market_quotes && !data.market_quotes.error) {
+        var quotes = data.market_quotes.quotes || [];
+        if (!quotes.length) pill('Markets', '—', 'No index quotes supplied');
+        quotes.slice(0, 3).forEach(function(q) {
+            pill(q.symbol || 'Index', q.price == null ? '—' : q.price, 'Latest supplied index quote; see the data drawer for source timestamp and other prices');
+        });
+    }
     if (data.earthquakes && !data.earthquakes.error) {
         var qc = (data.earthquakes.earthquakes || []).length;
         pill('Quakes', qc, 'Show earthquake markers on map', 'map', 'quakes');
@@ -2215,8 +2258,14 @@ function updateHudStats(data) {
         var ac = conflictSrc.count || 0;
         pill('Conflict', ac, 'Show conflict markers on map', 'map', 'conflict');
     }
-    pill('Threat indicators', data.cyber_threats && !data.cyber_threats.error ? (data.cyber_threats.threats || []).length : '—',
-        'Reported cyber threat indicators (IOCs), not attack counts. Open Cyber details', 'drawer', 'cyber');
+    if (typeof dashboardProfile === 'undefined' || !dashboardProfile || dashboardProfile.counters.indexOf('cyber') >= 0) {
+        var cyberCount = data.cyber_threats && !data.cyber_threats.error ? (data.cyber_threats.threats || []).length : '—';
+        if (typeof dashboardProfile === 'undefined' || !dashboardProfile || dashboardProfile.sections.indexOf('cyber') >= 0) {
+            pill('Threat indicators', cyberCount, 'Reported cyber threat indicators (IOCs), not attack counts. Open Cyber details', 'drawer', 'cyber');
+        } else {
+            pill('Threat indicators', cyberCount, 'Reported cyber indicators, not attacks. The Cyber drawer section is disabled in this profile.');
+        }
+    }
     if (data.wildfires && !data.wildfires.error) {
         var fbr = data.wildfires.fires_by_region || {};
         var fireClusterCount = 0;
@@ -2270,7 +2319,100 @@ function updateHudStats(data) {
 
 // ════════════ DATA DRAWER ════════════
 
+function updateFocusedDrawer(data) {
+    _drawerItems = {}; _drawerIdx = 0;
+    var h = '';
+    function table(name, rows, columns) {
+        h += '<div class="sub">' + esc(name) + '</div>';
+        if (!rows || !rows.length) { h += '<div class="dim">No rows supplied; see request coverage above</div>'; return; }
+        h += '<table class="dtable"><thead><tr>' + columns.map(function(c) { return '<th>' + esc(c) + '</th>'; }).join('') + '</tr></thead><tbody>';
+        rows.slice(0, 20).forEach(function(row) { h += '<tr>' + row.map(function(value) { return '<td>' + esc(value == null || typeof value === 'number' && !isFinite(value) ? '—' : String(value)) + '</td>'; }).join('') + '</tr>'; });
+        h += '</tbody></table>';
+    }
+    function source(name) {
+        var value = data[name];
+        if (!value) return null;
+        var coverage = value._coverage;
+        var label = coverage ? coverage.state + ' (' + coverage.current + '/' + coverage.attempted + ' current reads; ' + coverage.stale + ' stale; ' + coverage.failed + ' failed; ' + coverage.unknown + ' unverified)' : 'unknown';
+        h += '<div class="dim">' + esc(name.replace(/_/g, ' ')) + ': request/cache coverage ' + esc(label) + '; adapter timestamp ' + esc(String(value.timestamp || value.fetched_at || value.date || 'unknown')) + '</div>';
+        if (value.error || (name === 'cyber_threats' || name === 'cable_health') && (!coverage || coverage.state !== 'current')) return null;
+        return value;
+    }
+    function finiteNumber(value) { return typeof value === 'number' && isFinite(value) ? value : null; }
+    if (dashboardProfile.sections.indexOf('markets') >= 0) {
+        h += '<div class="sh">MARKETS</div>';
+        ['market_quotes', 'commodity_quotes', 'crypto_quotes'].forEach(function(key) {
+            var d = source(key); if (!d) return;
+            table(key.replace(/_/g, ' '), (d.quotes || d.commodities || d.coins || []).map(function(q) {
+                return [q.symbol || q.name, q.price == null ? q.current_price : q.price, q.change_pct == null ? q.price_change_percentage_24h : q.change_pct];
+            }), ['Symbol', 'Price', 'Change %']);
+        });
+        var forex = source('forex_rates');
+        if (forex) table('FX / ' + (forex.base || 'USD'), Object.keys(forex.rates || {}).map(function(key) { return [key, forex.rates[key]]; }), ['Currency', 'Rate']);
+        var yields = source('yield_curve');
+        if (yields) table('Treasury yields', (yields.yields || []).map(function(q) { return [q.maturity, q.rate, q.date]; }), ['Maturity', 'Rate %', 'Date']);
+        var macro = source('macro_signals');
+        var macroFields = {
+            fear_greed: ['Fear & greed', 'value', 'index'],
+            mempool_fees: ['Mempool fastest fee', 'fastest_fee', 'sat/vB'],
+            dxy: ['US dollar index', 'price', 'index points'],
+            vix: ['VIX', 'price', 'index points'],
+            gold: ['Gold', 'price', 'USD/oz'],
+            treasury_10y: ['US Treasury 10Y', 'price', '%'],
+            btc_dominance: ['BTC dominance', 'btc_dominance_pct', '%']
+        };
+        if (macro) table('Macro', Object.keys(macro.signals || {}).map(function(key) {
+            var info = Object.prototype.hasOwnProperty.call(macroFields, key) ? macroFields[key] : null;
+            var s = macro.signals[key];
+            return [info ? info[0] : 'Unsupported signal: ' + key, info && s ? finiteNumber(s[info[1]]) : null, info ? info[2] : 'not mapped'];
+        }), ['Signal', 'Value', 'Unit']);
+    }
+    if (dashboardProfile.sections.indexOf('cyber') >= 0) {
+        h += '<div class="sh" data-section="cyber">CYBER / SECURITY</div>';
+        var cyber = source('cyber_threats');
+        if (!cyber) h += '<div class="dim">Cyber threat data unavailable or disabled.</div>';
+        else {
+            h += '<div class="dim">Threat indicators, not attack counts.</div>';
+            h += '<table class="dtable"><thead><tr><th>Indicator</th><th>Severity</th></tr></thead><tbody>';
+            (cyber.threats || []).slice(0, 20).forEach(function(t) {
+                h += '<tr data-click="' + _storeItem('cyber', t) + '"><td>' + esc(t.indicator || t.url || t.ioc || '—') + '</td><td>' + esc(t.severity || 'unknown') + '</td></tr>';
+            });
+            h += '</tbody></table>';
+        }
+        var status = source('service_status');
+        if (status) table('Service incidents', (status.incidents || []).map(function(s) { return [s.provider, s.title, s.severity]; }), ['Provider', 'Incident', 'Severity']);
+        var outages = source('internet_outages');
+        if (outages) h += '<div>' + esc(String(outages.outage_count == null ? (outages.outages || []).length : outages.outage_count)) + ' reported outages</div>';
+        var cables = source('cable_health');
+        if (cables) table('Cable warning estimates (not confirmed damage)', Object.keys(cables.corridors || {}).map(function(key) { var c = cables.corridors[key]; return [key.replace(/_/g, ' '), c.status_label, (c.relevant_warnings || []).length]; }), ['Corridor', 'Heuristic', 'Warnings']);
+    }
+    if (dashboardProfile.sections.indexOf('military') >= 0) {
+        h += '<div class="sh">MILITARY</div>';
+        var flights = source('military_flights');
+        if (flights) table('Military aircraft', (flights.aircraft || []).map(function(a) { return [a.callsign, a.origin_country, finiteNumber(a.altitude_m)]; }), ['Callsign', 'Country', 'Altitude (m)']);
+        var theater = source('theater_posture');
+        if (theater) table('Theater presence (live estimates, no baseline)', Object.keys(theater.theaters || {}).map(function(key) { var t = theater.theaters[key]; return [key.replace(/_/g, ' '), t.count, (t.countries || []).join(', ')]; }), ['Theater', 'Aircraft', 'Countries']);
+        ['acled_events', 'ucdp_events'].forEach(function(key) { var c = source(key); if (c) h += '<div>' + esc(key) + ': ' + esc(String(c.count || (c.events || []).length)) + ' events</div>'; });
+        var warnings = source('nav_warnings');
+        if (warnings) table('Navigation warnings', (warnings.warnings || []).map(function(w) { return [w.navarea || w.navArea, w.id, w.text]; }), ['Area', 'ID', 'Warning']);
+        var fleet = source('usni_fleet');
+        if (fleet) h += '<div>' + esc(fleet.report_title || 'Fleet report') + ' — ' + esc(String(fleet.ship_count == null ? 'count unavailable' : fleet.ship_count)) + ' ships reported</div>';
+    }
+    $('#drawerBody').innerHTML = safe(h);
+    try {
+        var collapsed = JSON.parse(localStorage.getItem('phoenix-drawer-collapsed')) || [];
+        $$('#drawerBody .sh').forEach(function(heading) {
+            if (collapsed.indexOf(heading.textContent.trim()) >= 0) {
+                heading.classList.add('collapsed');
+                var next = heading.nextElementSibling;
+                while (next && !next.classList.contains('sh')) { next.style.display = 'none'; next = next.nextElementSibling; }
+            }
+        });
+    } catch(e) {}
+}
+
 function updateDrawer(data) {
+    if (typeof dashboardProfile !== 'undefined' && dashboardProfile) { updateFocusedDrawer(profileData(data, 'sections')); return; }
     _drawerItems = {};
     _drawerIdx = 0;
     var h = '';
@@ -3121,6 +3263,20 @@ function updateAll(data) {
         ['news', function() { updateMapNews(data.news_feed); }]
     ];
     mapUpdates.forEach(function(pair) {
+        if (typeof dashboardProfile !== 'undefined' && dashboardProfile && dashboardProfile.layers.indexOf(pair[0]) < 0) return;
+        if (typeof dashboardProfile !== 'undefined' && dashboardProfile) {
+            var witnessed = {military: [data.military_flights, '#cntMil'], conflict: [conflictData, '#cntConflict'], navwarnings: [data.nav_warnings, '#cntNavWarn']}[pair[0]];
+            if (witnessed) {
+                var counter = document.querySelector(witnessed[1]);
+                var value = witnessed[0];
+                if (!value || value.error || value.degraded || !value._coverage || value._coverage.state !== 'current') {
+                    mapLayers[pair[0]].clearLayers();
+                    if (counter) { counter.textContent = '?'; counter.title = 'Request coverage is not current; the map is not confirmed empty'; }
+                    return;
+                }
+                if (counter) counter.title = '';
+            }
+        }
         try { pair[1](); } catch(e) { console.warn('updateAll: ' + pair[0] + ' failed:', e); }
     });
 
@@ -3138,7 +3294,11 @@ function updateAll(data) {
 
     // Feed health
     var feedKeys = Object.keys(data).filter(function(k) { return k !== 'source_health' && k !== 'cache_stats' && k !== 'timestamp'; });
+    if (typeof dashboardProfile !== 'undefined' && dashboardProfile) feedKeys = dashboardProfile.sources.filter(function(key) { return data[key] != null; });
     var okCount = feedKeys.filter(function(k) { return data[k] && !data[k].error; }).length;
+    if (typeof dashboardProfile !== 'undefined' && dashboardProfile) okCount = feedKeys.filter(function(key) {
+        var value = data[key]; return value && !value.error && !value.degraded && !value._stale && value._coverage && value._coverage.state === 'current';
+    }).length;
     $('#feedCount').textContent = okCount + '/' + feedKeys.length + ' feeds';
 
     if (data.timestamp) { $('#lastUpdate').textContent = new Date(data.timestamp).toLocaleTimeString(); }
@@ -3207,6 +3367,16 @@ function connectSSE() {
 
 // ════════════ BOOT ════════════
 initMap();
+if (dashboardProfile) {
+    Object.keys(layerState).forEach(function(key) {
+        if (dashboardProfile.layers.indexOf(key) < 0) {
+            layerState[key] = false;
+            if (mapLayers[key]) map.removeLayer(mapLayers[key]);
+            var row = document.querySelector('.layer-row[data-layer="' + key + '"]');
+            if (row) row.remove();
+        }
+    });
+}
 
 // Restore saved layer visibility
 (function() {
@@ -3388,13 +3558,13 @@ function updateMapAois(data) {
     cnt.textContent = aois.length;
     cnt.title = '';
 }
-fetch('/api/aois')
+if (!dashboardProfile || dashboardProfile.aois) fetch('/api/aois')
     .then(function(r) { return r.json(); })
     .then(function(data) { try { updateMapAois(data); } catch(e) { console.warn('aoi layer failed:', e); } })
     .catch(function(e) { console.warn('aoi fetch failed:', e); var c = $('#cntAoi'); c.textContent = '!'; c.title = String(e); });
 
 // Load static geospatial data immediately (bases, ports, nuclear facilities).
-fetch('/api/static')
+if (!dashboardProfile || dashboardProfile.static_map) fetch('/api/static')
     .then(function(r) { return r.json(); })
     .then(function(data) {
         latestStaticData = data;
@@ -3535,6 +3705,7 @@ $('#vecSearchInput').addEventListener('keydown', function(e) {
 // SSE connection for vector analytics
 var vecReconnectDelay = 1000;
 function connectVectorSSE() {
+    if (dashboardProfile && !dashboardProfile.vector) return;
     var source = new EventSource('/sse/vector-analytics');
     source.onmessage = function(event) {
         try {

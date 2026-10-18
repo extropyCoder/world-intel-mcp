@@ -146,7 +146,155 @@ oversized bodies 413, unavailable vector storage 503, and internal search
 failures a generic 500. Validation happens before request-time initialization.
 These limits apply to the dashboard endpoint, not the MCP vector-search API.
 
-### Headless smoke run + local browser (scripted)
+### Persistent focused dashboard (normal headless use)
+
+For a small Linux host (one worker; intended for a 2-core/4-GB machine), use the
+focused launcher rather than keeping a disposable smoke environment alive.
+**On the remote machine**, from this trusted checkout:
+
+```bash
+./scripts/dashboard.sh setup
+./scripts/dashboard.sh start
+```
+
+Or run `./scripts/dashboard.sh` and choose **Setup**, then run it again and choose
+**Start**. The defaults need no config edits or credentials. Setup explicitly
+downloads official PyPI wheels and builds only this local project's `dashboard`
+extra in a new, managed venv; no dev/vector/PDF extras, model downloads, collector,
+Qdrant or Ollama. It does not reuse another venv or change user/global packages.
+Missing OS venv support uses the existing default-NO prerequisite prompt; only an
+explicit approval can invoke the system package manager. No OS installs occur
+otherwise. Python >=3.11 and Linux pidfd support are required; Python 3.14 still
+depends on upstream wheel availability. Select an existing interpreter with
+`DASHBOARD_PYTHON=/path/to/python3.12 ./scripts/dashboard.sh setup` if necessary.
+**Never sudo this launcher.**
+
+**On the local browser machine**, run the existing helper:
+
+```bash
+./scripts/smoke-tunnel.sh
+```
+
+Answer the SSH destination and ports (remote **8501**, local **18501** by default),
+then open its printed `http://127.0.0.1:18501/` URL. The dashboard always binds to
+**127.0.0.1**, with proxy-header trust off. Start waits up to 30 seconds for a
+PID-owned loopback listener and checks health/root plus Host/Origin isolation.
+It refuses to kill an existing port occupant. After readiness it detaches and
+survives SSH disconnect; closing the tunnel does not stop it.
+
+Use the same remote script/menu for control:
+
+```bash
+./scripts/dashboard.sh status
+./scripts/dashboard.sh logs          # bounded tail, returns immediately
+./scripts/dashboard.sh logs --follow # explicitly follow until Ctrl+C
+./scripts/dashboard.sh stop
+```
+
+Stop uses the verified UID, process start time, exact command and random identity
+token plus a **Linux pidfd**, never just a PID number or an unverified process
+group. It allows 10 seconds for TERM, then kills only that same process if needed.
+The single server process starts no subprocess workers. Stop preserves cache,
+config, AOIs and logs. No autostart/reboot service is installed. Ctrl+C while
+following logs stops only the log viewer; use **Stop** for the detached server.
+
+#### Profile and private state
+
+Default state is `${XDG_STATE_HOME:-~/.local/state}/world-intel-dashboard`, with
+its venv, `dashboard.toml`, cache DB, locks, process record and logs together.
+Directories are private 0700, control/log/config files 0600. Symlink ancestors,
+unsafe ownership/permissions, linked control files and unowned existing venvs
+are refused rather than chmodded, deleted or adopted. `--state /canonical/private/path`
+selects a different location; use it consistently for all actions. Existing
+production caches/AOIs are never used. Runtime logs rotate at 1 MiB with three
+backups; source-library chatter/access logs are suppressed and credential values
+and URLs are filtered. This is not an OS sandbox or protection from this UID/root.
+
+Setup copies [`dashboard.example.toml`](dashboard.example.toml) only if no private
+config exists. The version-1 TOML is strictly validated: unknown keys, duplicate
+selections, non-finite coordinates, boolean-as-integer values, invalid ranges,
+URLs/modules/security overrides and enabled optional services are rejected.
+`refresh_seconds` is 30–3600 (default **60**); source TTLs still apply. At most four
+top-level sources run concurrently per snapshot; sources can have their own
+bounded internal fan-out. This is not a whole-process memory/CPU quota.
+
+The default **markets / cyber / military** profile includes:
+
+- **Markets:** index quotes, crypto, current FX, commodities, Treasury yields and
+  the existing seven-signal macro summary. The HUD shows up to three index prices;
+  the drawer adds FX/yield/commodity tables and source freshness labels.
+- **Cyber:** threat feeds including CISA KEV, service incidents, internet outages
+  and cable-warning estimates.
+- **Military:** live aircraft, theater presence, navigation warnings, ACLED/UCDP
+  conflict events and the latest USNI fleet report. Curated static infrastructure
+  is shown on the map; AOI reading is off by default.
+
+Migration/displacement, webcams, exposure, Convergence, weather/disasters, health,
+elections, general traffic, research/AI and historical-baseline collection are
+not automatically fetched in this profile. No global alert/risk/weekly/posture/
+situation composites are invoked. Focused alerts use **only already selected
+results**: cable warning scores and critical-severity cyber indicator counts.
+Supported thresholds are `cable_score` (1–3) and `cyber_critical` (1–10000), not a
+universal analytical-algorithm control. Military surge/history analysis is not
+enabled. Missing/stale supporting sources mark the digest degraded; a cable
+heuristic is not confirmed damage and an IOC is not an attack.
+
+Focused coverage is measured before adapters normalize data: each source has an
+isolated request witness, including stale non-dict/XML fallbacks. Public coverage
+contains only source/operation/outcome and counts, not URLs, request labels,
+headers or cache keys. Recognized successful empty feeds remain valid zeros;
+missing, malformed, partial, stale or unrecognized reads are not healthy empty
+feeds. Cable status becomes **unknown** when its evidence is not current; the
+HUD/feed metrics do not count unverified results as current. Adapter-generated
+timestamps alone are not freshness proof. Previously witnessed processed-cache
+entries have a separate coverage sidecar; older unwitnessed entries are unverified.
+The sidecar is bound to that entry's SQLite row generation, write time, expiry
+and canonical value digest (all private, never public metadata). Focused writes
+commit the value and sidecar together; reads use one SQLite snapshot. Replacing
+the key through the ordinary Cache API invalidates its old attestation, even for
+identical values and timestamps. Custom/opaque cache implementations remain
+unverified rather than inheriting coverage; no shared Cache schema migration is
+required.
+Shared source/MCP payloads are not modified, and the browser uses a new
+provenance-aware cache namespace. Focused startup also avoids importing legacy
+temporal/composite modules, so importing the focused app creates no temporal DB.
+
+Aircraft display uses a focused **copy**: the legacy ADSB.LOL adapter currently
+places `alt_baro` feet in its `altitude_m` field, so focused output converts those
+feet to metres. OpenSky's metres are retained. Normalized copies carry an explicit
+unit marker to prevent double conversion; unknown providers, non-finite values
+and the ADSB `ground` string have unknown altitude, not an invented zero metres.
+Valid numeric zero remains zero. Raw shared source/MCP payloads are unchanged;
+this does not claim to fix their legacy unit inconsistency.
+
+Optional `sources = [...]` restricts the trusted list within enabled `groups`.
+`ui.sections`/`ui.counters` select only those enabled groups; they affect display,
+not fetching (disable a source/group to prevent its work). `[map]` controls finite
+center/zoom and static/AOI reads. `[services]` values must remain false: vector,
+Ollama and history cannot be switched on in this focused implementation, even if
+their packages/services happen to be installed. Browser vector SSE is not opened.
+Focused browser caches are namespaced by validated profile, so old global data
+cannot resurrect disabled feeds. `/api/profile` exposes only allowlisted display
+metadata, never paths, credentials or the operator's environment.
+
+For optional credentials, `start --env-file /private/credentials.env` reads a
+UID-owned 0600 file under a private directory via dotenv **without interpolation
+or shell sourcing**. Only `ACLED_EMAIL`, `ACLED_PASSWORD`, `UCDP_ACCESS_TOKEN`,
+`FRED_API_KEY`, `OPENSKY_CLIENT_ID` and `OPENSKY_CLIENT_SECRET` are accepted. No
+credential values belong in TOML. Inherited credentials, repo `.env`, proxy/CA
+overrides and arbitrary Python/pip environment settings are not reused by the
+managed worker. Credentials are optional; unauthenticated providers can be
+unavailable or rate-limited without blocking other sources.
+
+`start --config /private/custom.toml` selects another validated private config.
+Settings are loaded once; stop/start to apply edits. After updating this checkout,
+stop and run `setup --refresh` to rebuild the managed install without overwriting
+config/cache. Plain `intel-dashboard` **without** `WORLD_INTEL_CONFIG` retains the
+legacy global dashboard; an explicit operator `WORLD_INTEL_CONFIG` enables the
+focused path there too. MCP tools/source algorithms and manual API routes are
+unchanged. A headless host still cannot initiate your local browser's SSH tunnel.
+
+### Headless smoke run + local browser (disposable checks)
 
 **On the remote/headless Linux machine**, from this checkout:
 
@@ -155,6 +303,8 @@ These limits apply to the dashboard endpoint, not the MCP vector-search API.
 ```
 
 This explicitly performs **live public-network checks and PyPI installation**.
+This separate smoke mode intentionally still queries earthquake, forex and
+service-status APIs; it does not follow the normal focused profile above.
 It creates a new private temporary venv/state directory on every run, installs
 only this project's `dashboard,dev` extras (plus a dotenv version supporting
 disable mode), then runs just the existing earthquake, forex and service-status

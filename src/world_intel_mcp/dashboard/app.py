@@ -8,14 +8,16 @@ import asyncio
 import json
 import logging
 import math
+import os
 import re
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, aclosing
 from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).resolve().parents[3] / ".env", override=False)
+if not os.environ.get("WORLD_INTEL_CONFIG"):
+    load_dotenv(Path(__file__).resolve().parents[3] / ".env", override=False)
 
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -23,44 +25,31 @@ from starlette.requests import ClientDisconnect
 from starlette.responses import HTMLResponse, JSONResponse, StreamingResponse
 from starlette.routing import Route
 
-from world_intel_mcp.analysis.aoi import AOIStore
 from world_intel_mcp.cache import Cache
 from world_intel_mcp.circuit_breaker import CircuitBreaker
 from world_intel_mcp.fetcher import Fetcher
+from world_intel_mcp.dashboard.settings import from_environment
+from world_intel_mcp.dashboard import focused
+
+_settings = from_environment()  # operator-selected once; never selected by a request
 from world_intel_mcp.diagnostics import exception_summary, safe_error, sanitize_error_fields
-from world_intel_mcp.sources import (
-    markets,
-    seismology,
-    military,
-    infrastructure,
-    maritime,
-    economic,
-    wildfire,
-    cyber,
-    news,
-    prediction,
-    displacement,
-    aviation,
-    climate,
-    conflict,
-    intelligence,
-    space_weather,
-    ai_watch,
-    health,
-    elections,
-    shipping,
-    social,
-    nuclear,
-    service_status,
-    traffic,
-    migration,
-)
-from world_intel_mcp.analysis.alerts import fetch_alert_digest, fetch_weekly_trends
-from world_intel_mcp.analysis.posture import fetch_strategic_posture
-from world_intel_mcp.analysis.exposure import fetch_population_exposure
-from world_intel_mcp.analysis.situation import fetch_situation_brief
-from world_intel_mcp.sources.fleet import fetch_fleet_report
-from world_intel_mcp.sources.usni_fleet import fetch_usni_fleet
+if _settings is None:
+    # Legacy composites can initialize temporal storage during import. A focused
+    # process must not import them, even if it never calls their fetch functions.
+    from world_intel_mcp.analysis.aoi import AOIStore
+    from world_intel_mcp.sources import (
+        markets, seismology, military, infrastructure, maritime, economic,
+        wildfire, cyber, news, prediction, displacement, aviation, climate,
+        conflict, intelligence, space_weather, ai_watch, health, elections,
+        shipping, social, nuclear, service_status, traffic, migration,
+    )
+    from world_intel_mcp.analysis.alerts import fetch_alert_digest, fetch_weekly_trends
+    from world_intel_mcp.analysis.posture import fetch_strategic_posture
+    from world_intel_mcp.analysis.exposure import fetch_population_exposure
+    from world_intel_mcp.analysis.situation import fetch_situation_brief
+    from world_intel_mcp.sources.fleet import fetch_fleet_report
+    from world_intel_mcp.sources.usni_fleet import fetch_usni_fleet
+    from world_intel_mcp.sources.central_banks import fetch_central_bank_rates
 from world_intel_mcp.config.countries import (
     INTEL_HOTSPOTS,
     STRATEGIC_WATERWAYS,
@@ -78,7 +67,6 @@ from world_intel_mcp.config.trade_routes import (
     CLOUD_REGIONS,
     FINANCIAL_CENTERS,
 )
-from world_intel_mcp.sources.central_banks import fetch_central_bank_rates
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +140,8 @@ def _ensure_fetcher() -> Fetcher:
         _breaker = CircuitBreaker()
         # Vector store — optional, dashboard populates it alongside the MCP server
         try:
+            if _settings is not None:
+                raise ImportError("Focused dashboard does not use vector storage")
             from world_intel_mcp.vector_store import VectorStore
 
             _vector_store = VectorStore(enabled=True)
@@ -161,7 +151,7 @@ def _ensure_fetcher() -> Fetcher:
     return _fetcher
 
 
-def _open_aoi_store() -> AOIStore:
+def _open_aoi_store() -> "AOIStore":
     """Open the AOI store on the same cache database the MCP server and
     CLI write geofences to, so the map shows exactly the areas a user
     defined over MCP.
@@ -172,6 +162,7 @@ def _open_aoi_store() -> AOIStore:
     test client's portal thread; any ``to_thread`` path) raises. A
     fresh connection per read is cheap and thread-safe by construction,
     the same pattern ``analysis.aoi.fetch_aoi_sweep`` uses."""
+    from world_intel_mcp.analysis.aoi import AOIStore
     return AOIStore(_ensure_fetcher().cache.db_path)
 
 
@@ -238,6 +229,8 @@ def _conflict_zones_fallback(acled: dict | None, ucdp: dict | None) -> dict | No
 
 async def _fetch_overview() -> dict:
     """Fetch all dashboard domains in parallel, return unified dict."""
+    if _settings is not None:
+        return sanitize_error_fields(await focused.snapshot(_settings, _ensure_fetcher()))
     fetcher = _ensure_fetcher()
 
     coros = {
@@ -388,7 +381,13 @@ async def _fetch_overview() -> dict:
 async def index(request):
     """Serve the dashboard HTML page (reloads on each request during dev)."""
     html_path = Path(__file__).parent / "index.html"
-    return HTMLResponse(html_path.read_text())
+    html = html_path.read_text()
+    metadata = json.dumps(_settings.public()).replace("<", "\\u003c") if _settings else "null"
+    return HTMLResponse(html.replace("var dashboardProfile = null;", "var dashboardProfile = " + metadata + ";"))
+
+
+async def api_profile(request):
+    return JSONResponse(_settings.public() if _settings else {"focused": False})
 
 
 async def api_overview(request):
@@ -402,6 +401,8 @@ _CONFLICT_FEEDS = ("acled_events", "ucdp_events")
 
 def _stream_source_defs(fetcher: Fetcher) -> dict:
     """Source name -> zero-arg coroutine factory for one /api/stream tick."""
+    if _settings is not None:
+        return focused.factories(_settings, fetcher)
     return {
         "market_quotes": lambda: markets.fetch_market_quotes(fetcher),
         "crypto_quotes": lambda: markets.fetch_crypto_quotes(fetcher),
@@ -484,6 +485,16 @@ async def api_stream(request):
         while True:
             try:
                 fetcher = _ensure_fetcher()
+
+                if _settings is not None:
+                    # One shared bounded snapshot; no global composites, no
+                    # orphan per-source tasks on disconnect/cancellation.
+                    async with aclosing(focused.events(_settings, fetcher)) as events:
+                        async for result in events:
+                            result = sanitize_error_fields(result)
+                            yield f"data: {json.dumps(result, default=str)}\n\n"
+                    await asyncio.sleep(_settings.refresh_seconds)
+                    continue
 
                 # Sources to fetch, grouped so fast ones arrive first
                 source_defs = _stream_source_defs(fetcher)
@@ -721,6 +732,7 @@ async def api_migration(request):
     secondary: if only it fails, the largest corridors are still returned with
     ``rising_error`` set.
     """
+    from world_intel_mcp.sources import migration  # manual endpoint only
     try:
         limit = int(request.query_params.get("limit", _MIGRATION_DEFAULT_LIMIT))
         year_param = request.query_params.get("year")
@@ -820,6 +832,8 @@ async def sse_vector_analytics(request):
 
 async def _fetch_vector_analytics() -> dict:
     """Gather vector store stats, domain summary, and trend detection."""
+    if _settings is not None:
+        return {"available": False}
     _ensure_fetcher()
     if _vector_store is None:
         return {
@@ -941,19 +955,31 @@ async def api_vector_search(request):
 @asynccontextmanager
 async def lifespan(app):
     """Start/stop vector store worker alongside the app."""
+    global _fetcher, _cache, _breaker
     _ensure_fetcher()
     if _vector_store:
         await _vector_store.start()
         logger.info("Dashboard vector store worker started")
-    yield
-    if _vector_store:
-        await _vector_store.stop()
-        logger.info("Dashboard vector store worker stopped")
+    try:
+        yield
+    finally:
+        if _vector_store:
+            await _vector_store.stop()
+            logger.info("Dashboard vector store worker stopped")
+        if _settings is not None:
+            try:
+                if _fetcher is not None:
+                    await _fetcher.close()
+            finally:
+                if _cache is not None:
+                    _cache.close()
+                _fetcher = _cache = _breaker = None
 
 
 app = Starlette(
     routes=[
         Route("/", index),
+        Route("/api/profile", api_profile),
         Route("/api/overview", api_overview),
         Route("/api/stream", api_stream),
         Route("/api/static", api_static),
@@ -977,7 +1003,7 @@ def _parse_run_args(argv: list[str] | None = None) -> tuple[str, int]:
     default_port = int(
         os.environ.get(
             "WORLD_INTEL_DASHBOARD_PORT",
-            os.environ.get("PORT", "8501"),
+            os.environ.get("PORT", str(_settings.port) if _settings else "8501"),
         )
     )
     parser = argparse.ArgumentParser(description="Run the World Intelligence dashboard")
