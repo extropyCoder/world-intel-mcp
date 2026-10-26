@@ -198,7 +198,7 @@ def test_preexisting_unowned_venv_and_unsafe_pid_or_log_are_not_overwritten(stat
     manager.write_private(target, b"user work")
     for name in ("control.lock", "server.json", "dashboard.log"):
         (state / name).symlink_to(target)
-        with pytest.raises(OSError):
+        with pytest.raises((manager.ManagerError, OSError)):
             manager.read_private(state / name)
     assert target.read_bytes() == b"user work"
 
@@ -227,7 +227,7 @@ def test_wrapper_works_from_scripts_directory_and_does_not_eval_python(tmp_path)
     result = subprocess.run(["bash", str(ROOT / "scripts/dashboard.sh"), "status"], cwd=ROOT / "scripts",
                             env={"PATH": os.defpath, "DASHBOARD_PYTHON": str(executable)},
                             capture_output=True, text=True, check=True, timeout=10)
-    assert json.loads(result.stdout) == ["-I", str(ROOT / "scripts/dashboard_manager.py"), "status"]
+    assert json.loads(result.stdout) == ["-I", "-B", str(ROOT / "scripts/dashboard_manager.py"), "status"]
 
 
 def test_rotation_redaction_and_permissions_do_not_depend_on_parent_umask(state):

@@ -210,6 +210,25 @@ production caches/AOIs are never used. Runtime logs rotate at 1 MiB with three
 backups; source-library chatter/access logs are suppressed and credential values
 and URLs are filtered. This is not an OS sandbox or protection from this UID/root.
 
+If setup refuses an **unsafe directory**, get the exact path before attempting
+any remediation:
+
+```bash
+./scripts/dashboard.sh doctor
+```
+
+The read-only diagnostic (also menu option **6**) prints the selected absolute
+state path and each inspected ancestor's mode, owner UID and current UID. It
+distinguishes group/world-writable ancestors, symlinks/wrong ownership and a final
+directory that is not private. It stops before traversing an unsafe component;
+paths/control characters are quoted. Missing directories are reported without
+creating them or claiming creation/write access is verified. The command creates
+no state or lock, reads no credentials/config contents, installs nothing and
+changes no permissions. For a custom location, use the same `--state` with doctor.
+Setup refusals now include these path/mode/UID details too. Share that output for
+a narrowly scoped plan; do **not** run broad chmod/chown or sudo the launcher.
+The permission policy is unchanged and no automatic repair is performed.
+
 Setup copies [`dashboard.example.toml`](dashboard.example.toml) only if no private
 config exists. The version-1 TOML is strictly validated: unknown keys, duplicate
 selections, non-finite coordinates, boolean-as-integer values, invalid ranges,

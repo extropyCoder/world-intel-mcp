@@ -7,6 +7,12 @@ started. Same-UID/root path replacement is outside this isolation boundary.
 """
 from __future__ import annotations
 
+import sys
+
+# Doctor must remain read-only even when run directly with Python -I (which
+# ignores PYTHONDONTWRITEBYTECODE). Set this before any helper imports.
+sys.dont_write_bytecode = True
+
 import argparse
 from contextlib import contextmanager
 import fcntl
@@ -21,7 +27,6 @@ import secrets
 import signal
 import stat
 import subprocess
-import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -48,36 +53,108 @@ class ManagerError(Exception):
     pass
 
 
+def quoted_path(path):
+    # Paths are useful operator diagnostics, but must not inject terminal/log
+    # controls or extra lines. Do not resolve() an untrusted symlink to print it.
+    return json.dumps(os.fspath(path), ensure_ascii=True)
+
+
+def observed(path, info):
+    return (f"path={quoted_path(path)}, mode={stat.S_IMODE(info.st_mode):04o}, "
+            f"owner_uid={info.st_uid}, current_uid={os.geteuid()}")
+
+
+def directory_problem(path, info, final):
+    details = observed(path, info)
+    if not stat.S_ISDIR(info.st_mode):
+        kind = "symlink" if stat.S_ISLNK(info.st_mode) else "not a directory"
+        return f"Unsafe directory type ({kind}): {details}; expected a directory, never a symlink"
+    if info.st_uid not in (0, os.geteuid()):
+        return f"Unsafe directory ownership: {details}; expected owner UID 0 or {os.geteuid()} for ancestors, UID {os.geteuid()} for the final state directory"
+    if info.st_mode & 0o022 and (final or not info.st_mode & stat.S_ISVTX):
+        writable = " and ".join(name for bit, name in ((0o020, "group-writable"), (0o002, "world-writable")) if info.st_mode & bit)
+        role = "state directory" if final else "ancestor"
+        expectation = "no group/world write bits on the final directory (even with sticky bit)" if final else "no group/world write bits unless this ancestor has the sticky bit"
+        return f"Unsafe writable {role} ({writable}): {details}; expected {expectation}"
+    if final and (info.st_uid != os.geteuid() or info.st_mode & 0o077):
+        return f"Final directory is not UID-owned/private: {details}; expected owner UID {os.geteuid()} and no group/other permissions (normally 0700)"
+    return None
+
+
 def private_dir(path, create=False):
     path = Path(path).absolute()
     if ".." in path.parts:
-        raise ManagerError("Use canonical state paths without '..'")
+        raise ManagerError(f"Noncanonical state path {quoted_path(path)}; expected an absolute path without '..'")
     for part in [*reversed(path.parents), path]:
         try:
             info = part.lstat()
         except FileNotFoundError:
             if not create:
                 raise
-            part.mkdir(mode=0o700)
-            info = part.lstat()
-        if not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, os.geteuid()):
-            raise ManagerError("Unsafe directory ownership/type or symlink")
-        if info.st_mode & 0o022 and (part == path or not info.st_mode & stat.S_ISVTX):
-            raise ManagerError("Unsafe writable directory")
-    if info.st_uid != os.geteuid() or info.st_mode & 0o077:
-        raise ManagerError("Dashboard state must be UID-owned and private (0700)")
+            try:
+                part.mkdir(mode=0o700)
+                info = part.lstat()
+            except OSError as exc:
+                raise ManagerError(f"Cannot create/inspect directory: path={quoted_path(part)}, mode/owner unavailable, current_uid={os.geteuid()}, errno={exc.errno}; expected creation as a private 0700 directory; no permissions were changed") from None
+        except OSError as exc:
+            raise ManagerError(f"Cannot inspect directory: path={quoted_path(part)}, mode/owner unavailable, current_uid={os.geteuid()}, errno={exc.errno}; expected lstat access to a directory; no traversal below it") from None
+        problem = directory_problem(part, info, final=part == path)
+        if problem:
+            raise ManagerError(problem)
     return path
+
+
+def doctor(path):
+    """Read-only lstat walk. Never inspect a child below an unsafe ancestor."""
+    path = Path(path).absolute()
+    print(f"State path (absolute; symlinks not resolved): {quoted_path(path)}")
+    print("Read-only: no creation, locks, permission changes, credentials or installs.")
+    if ".." in path.parts:
+        print("UNSAFE: expected a canonical path without '..'; no traversal performed.")
+        return 1
+    for part in [*reversed(path.parents), path]:
+        try:
+            info = part.lstat()
+        except FileNotFoundError:
+            print(f"MISSING: {quoted_path(part)}; no mode/owner to inspect. Remaining components were not inspected.")
+            print("Existing ancestors passed policy; setup would attempt missing directories with mode 0700. Creation/access has not been verified.")
+            return 0
+        except OSError as exc:
+            print(f"UNVERIFIED: path={quoted_path(part)}, errno={exc.errno}, current_uid={os.geteuid()}; mode/owner unavailable. Cannot inspect this component; no traversal below it.")
+            return 1
+        problem = directory_problem(part, info, final=part == path)
+        if problem:
+            print("UNSAFE: " + problem)
+            print("Stopped at this component; no links followed, repairs attempted or children inspected.")
+            return 1
+        print("PASS: " + observed(part, info))
+    print("Existing state directory passes path policy. File contents, write access and deployment readiness were not checked.")
+    return 0
+
+
+def file_problem(path, info):
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1 or info.st_mode & 0o077:
+        kind = "symlink" if stat.S_ISLNK(info.st_mode) else "invalid type/owner/links/permissions"
+        return f"Unsafe dashboard file ({kind}): {observed(path, info)}, hard_links={info.st_nlink}; expected a regular UID-owned file with one link and no group/other permissions (normally 0600)"
+    return None
 
 
 def open_private(path, flags=os.O_RDONLY):
     # Parents must already exist and pass the directory walk. Do not chmod an
     # existing file or follow a symlink/hardlink masquerading as a PID/log/lock.
     private_dir(Path(path).parent)
+    try:
+        problem = file_problem(path, Path(path).lstat())
+    except FileNotFoundError:
+        problem = None
+    if problem:
+        raise ManagerError(problem)
     fd = os.open(path, flags | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, 0o600)
     info = os.fstat(fd)
-    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1 or info.st_mode & 0o077:
+    problem = file_problem(path, info)
+    if problem:
         os.close(fd)
-        raise ManagerError("Unsafe dashboard file type, owner, links or permissions")
+        raise ManagerError(problem)
     return fd
 
 
@@ -382,7 +459,7 @@ def serve(state, config, token, env_file):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Persistent focused loopback dashboard (Linux, non-root). No automatic reboot service.")
-    parser.add_argument("action", nargs="?", choices=("setup", "start", "stop", "status", "logs", "_serve"))
+    parser.add_argument("action", nargs="?", choices=("setup", "start", "stop", "status", "logs", "doctor", "_serve"))
     parser.add_argument("--state", type=Path, default=Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "world-intel-dashboard")
     parser.add_argument("--config", type=Path, default=Path(os.environ["WORLD_INTEL_CONFIG"]) if os.environ.get("WORLD_INTEL_CONFIG") else None)
     parser.add_argument("--env-file", type=Path)
@@ -392,20 +469,22 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if sys.version_info < (3, 11) or sys.platform != "linux" or os.geteuid() == 0:
         raise ManagerError("Requires Linux and installed Python >=3.11; never run this script with sudo/root")
-    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
-        raise ManagerError("This Linux/Python needs pidfd support for safe persistent process control")
-    os.close(os.pidfd_open(os.getpid()))  # Require kernel support before any launch.
     if not args.action:
         if not sys.stdin.isatty():
-            parser.error("Choose setup/start/stop/status/logs")
-        print("1 Setup   2 Start   3 Stop   4 Status   5 Logs (bounded tail)")
+            parser.error("Choose setup/start/stop/status/logs/doctor")
+        print("1 Setup   2 Start   3 Stop   4 Status   5 Logs (bounded tail)   6 Doctor (read-only)")
         try:
             choice = input("Choose [4]: ").strip() or "4"
         except EOFError:
             return 1
-        args.action = {"1": "setup", "2": "start", "3": "stop", "4": "status", "5": "logs"}.get(choice)
+        args.action = {"1": "setup", "2": "start", "3": "stop", "4": "status", "5": "logs", "6": "doctor"}.get(choice)
         if args.action is None:
             parser.error("Invalid menu selection")
+    if args.action == "doctor":
+        return doctor(args.state)  # before pidfd probes, path creation or locking
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        raise ManagerError("This Linux/Python needs pidfd support for safe persistent process control")
+    os.close(os.pidfd_open(os.getpid()))  # Require kernel support before any launch.
     if not args.state.exists() and args.action != "setup":
         print("Not set up; run scripts/dashboard.sh setup first.")
         return 1
